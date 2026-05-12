@@ -1,6 +1,6 @@
 - Feature Name: `execution_lifecycle`
 - Start Date: 2026-05-12
-- RFC PR: [Climate-REF/rfcs#0000](https://github.com/Climate-REF/rfcs/pull/0000)
+- RFC PR: [Climate-REF/rfcs#0003](https://github.com/Climate-REF/rfcs/pull/3)
 
 # Summary
 [summary]: #summary
