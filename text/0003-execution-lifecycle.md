@@ -135,39 +135,60 @@ instead of eight thin ones.
 ## Module boundary
 
 ```mermaid
-flowchart TB
-    subgraph Lifecycle["<b>ExecutionLifecycle</b> &nbsp; <i>climate_ref.lifecycle</i>"]
-        direction TB
-        Public["<b>Public</b><br/>__init__(config, db, transport, *, retry, cv, clock)<br/>submit(execution, definition)<br/>drain(timeout=None)<br/>replay_abandoned() · dry_run(group, datasets)"]
-        Private["<b>Owned (private)</b><br/>_FragmentAllocator · _Classifier · _Promoter<br/>_Ingestor · _DirtyRule · _BundleWriter"]
-        Public --- Private
-    end
+classDiagram
+    direction LR
 
-    Lifecycle -- dispatch / poll --> Port
+    class ExecutionLifecycle {
+        <<climate_ref.lifecycle>>
+        +submit(execution, definition)
+        +drain(timeout) None
+        +replay_abandoned() list~int~
+        +dry_run(group, datasets) ExecutionDefinition
+        -_FragmentAllocator
+        -_Classifier
+        -_Promoter
+        -_Ingestor
+        -_DirtyRule
+        -_BundleWriter
+    }
 
-    subgraph Port["<b>Transport (Protocol)</b> &nbsp; <i>climate_ref_core.lifecycle.ports</i>"]
-        TP["name: ClassVar[str]<br/>dispatch(envelope: ExecutionEnvelope) -> None<br/>poll(block, timeout) -> Iterator[ExecutionOutcome]<br/>shutdown(timeout) -> None"]
-    end
+    class Transport {
+        <<Protocol>>
+        +name: ClassVar~str~
+        +dispatch(envelope: ExecutionEnvelope) None
+        +poll(block, timeout) Iterator~ExecutionOutcome~
+        +shutdown(timeout) None
+    }
 
-    Port --> Today
-    Port -.future.-> Future
+    class InMemoryTransport {
+        tests + SynchronousExecutor
+    }
+    class ProcessPoolTransport {
+        replaces LocalExecutor
+    }
+    class CeleryTransport {
+        climate-ref-celery
+    }
+    class SlurmTransport {
+        future
+        sbatch --mem --cpus --time --partition
+    }
+    class PbsTransport {
+        future
+        qsub -l mem,ncpus,walltime,queue
+    }
+    class K8sTransport {
+        future
+        pod resources + activeDeadlineSeconds
+    }
 
-    subgraph Today["<b>Adapters in this RFC</b>"]
-        direction LR
-        InMem["InMemoryTransport<br/><i>tests + SynchronousExecutor replacement</i>"]
-        PP["ProcessPoolTransport<br/><i>replaces LocalExecutor body</i>"]
-        CT["CeleryTransport<br/><i>in climate-ref-celery</i>"]
-    end
-
-    subgraph Future["<b>Future adapters &mdash; seam supports them</b>"]
-        direction LR
-        SLURM["SlurmTransport<br/><i>sbatch --mem --cpus --time --partition</i>"]
-        PBS["PbsTransport<br/><i>qsub -l mem,ncpus,walltime,queue</i>"]
-        K8s["K8sTransport<br/><i>pod resources + activeDeadlineSeconds</i>"]
-    end
-
-    classDef future stroke-dasharray: 5 5
-    class Future,SLURM,PBS,K8s future
+    ExecutionLifecycle ..> Transport : dispatch / poll
+    InMemoryTransport ..|> Transport
+    ProcessPoolTransport ..|> Transport
+    CeleryTransport ..|> Transport
+    SlurmTransport ..|> Transport
+    PbsTransport ..|> Transport
+    K8sTransport ..|> Transport
 ```
 
 ## Wire types
