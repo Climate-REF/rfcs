@@ -134,46 +134,40 @@ instead of eight thin ones.
 
 ## Module boundary
 
-```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│ ExecutionLifecycle (climate_ref.lifecycle)                                   │
-│                                                                              │
-│   __init__(config, db, transport, *,                                         │
-│            retry=DefaultRetryPolicy(),                                       │
-│            cv=None,           # default: CV.load_from_file(config.paths…)    │
-│            clock=datetime.utcnow)                                            │
-│                                                                              │
-│   submit(execution, definition) -> None                                      │
-│   drain(timeout=None) -> None                                                │
-│                                                                              │
-│   replay_abandoned() -> list[int]    # find executions stranded across boot  │
-│   dry_run(group, datasets) -> ExecutionDefinition                            │
-│                                                                              │
-│   OWNED (private):                                                           │
-│     _FragmentAllocator   _Classifier   _Promoter      _Ingestor              │
-│     _DirtyRule           _BundleWriter (worker-side)                         │
-└──────────────────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼ Port — the ONLY thing that varies per backend
-┌──────────────────────────────────────────────────────────────────────────────┐
-│ Transport (Protocol, climate_ref_core.lifecycle.ports)                       │
-│                                                                              │
-│   name: ClassVar[str]                                                        │
-│   dispatch(envelope: ExecutionEnvelope) -> None                              │
-│   poll(block: bool, timeout: float | None)                                   │
-│       -> Iterator[ExecutionOutcome]                                          │
-│   shutdown(timeout: float | None) -> None                                    │
-│                                                                              │
-│ Production adapters:                                                         │
-│   InMemoryTransport      (in climate-ref, used by tests & SynchronousExec)   │
-│   ProcessPoolTransport   (in climate-ref, replaces LocalExecutor body)       │
-│   CeleryTransport        (in climate-ref-celery)                             │
-│                                                                              │
-│ Future adapters (NOT in this RFC, but the seam supports them):               │
-│   SlurmTransport         consumes ResourceHint as --mem/--cpus/--time/-p     │
-│   PbsTransport           consumes ResourceHint as -l mem,ncpus,walltime,q    │
-│   K8sTransport           consumes ResourceHint as pod resources + deadline   │
-└──────────────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph Lifecycle["<b>ExecutionLifecycle</b> &nbsp; <i>climate_ref.lifecycle</i>"]
+        direction TB
+        Public["<b>Public</b><br/>__init__(config, db, transport, *, retry, cv, clock)<br/>submit(execution, definition)<br/>drain(timeout=None)<br/>replay_abandoned() · dry_run(group, datasets)"]
+        Private["<b>Owned (private)</b><br/>_FragmentAllocator · _Classifier · _Promoter<br/>_Ingestor · _DirtyRule · _BundleWriter"]
+        Public --- Private
+    end
+
+    Lifecycle -- dispatch / poll --> Port
+
+    subgraph Port["<b>Transport (Protocol)</b> &nbsp; <i>climate_ref_core.lifecycle.ports</i>"]
+        TP["name: ClassVar[str]<br/>dispatch(envelope: ExecutionEnvelope) -> None<br/>poll(block, timeout) -> Iterator[ExecutionOutcome]<br/>shutdown(timeout) -> None"]
+    end
+
+    Port --> Today
+    Port -.future.-> Future
+
+    subgraph Today["<b>Adapters in this RFC</b>"]
+        direction LR
+        InMem["InMemoryTransport<br/><i>tests + SynchronousExecutor replacement</i>"]
+        PP["ProcessPoolTransport<br/><i>replaces LocalExecutor body</i>"]
+        CT["CeleryTransport<br/><i>in climate-ref-celery</i>"]
+    end
+
+    subgraph Future["<b>Future adapters &mdash; seam supports them</b>"]
+        direction LR
+        SLURM["SlurmTransport<br/><i>sbatch --mem --cpus --time --partition</i>"]
+        PBS["PbsTransport<br/><i>qsub -l mem,ncpus,walltime,queue</i>"]
+        K8s["K8sTransport<br/><i>pod resources + activeDeadlineSeconds</i>"]
+    end
+
+    classDef future stroke-dasharray: 5 5
+    class Future,SLURM,PBS,K8s future
 ```
 
 ## Wire types
@@ -336,35 +330,47 @@ and telemetry persistence.
 
 ## End-to-end sequence
 
-```
-Solver        Diagnostic       Lifecycle           Transport          Worker             DB
-  │ submit(e,d)   │                │                    │                  │                 │
-  ├──────────────►│ resources_for(d)│                   │                  │                 │
-  │ ◄──── ResourceHint(...)        │                    │                  │                 │
-  │              │                 │ allocate fragment ─┼──────────────────┼────────────────►│
-  │              │                 │ register_datasets ─┼──────────────────┼────────────────►│
-  │              │                 │ session.expunge                                          │
-  │              │                 │ commit ──────────────────────────────────────────────── │
-  │              │                 │ deadline = now + r.wall_clock                            │
-  │              │                 │ dispatch(envelope)─►│  (slurm sbatch / celery send /    │
-  │              │                 │                    │   processpool.submit / inline)     │
-  │              │                 │                    ├─►│ execute_locally(envelope)      │
-  │              │                 │                    │  │   diagnostic.run               │
-  │              │                 │                    │  │   _BundleWriter.write          │
-  │              │                 │                    │  │   CV.validate (hard-fail)      │
-  │              │                 │                    │  │   capture Telemetry            │
-  │              │                 │                    │  │   return ExecutionOutcome      │
-  │              │                 │                    │◄─│                                │
-  │ drain()      │                 │ poll() ◄───────────│                                    │
-  │ ────────────►│                 │ _finalize:                                              │
-  │              │                 │   session.merge(eid) ───────────────────────────────────►│
-  │              │                 │   _Promoter.copy(scratch→results, log+bundles+refs)     │
-  │              │                 │   _Classifier(failure or result) → Success|Retry|GiveUp │
-  │              │                 │   _Ingestor.upsert(outputs, scalars, series) ──────────►│
-  │              │                 │   _DirtyRule.apply(decision) ──────────────────────────►│
-  │              │                 │   execution.telemetry = outcome.telemetry ─────────────►│
-  │              │                 │   execution.mark_{successful,failed} ─────────────────►│
-  │ done         │                 │                    │                                    │
+```mermaid
+sequenceDiagram
+    autonumber
+    participant S as Solver
+    participant D as Diagnostic
+    participant L as ExecutionLifecycle
+    participant T as Transport
+    participant W as Worker
+    participant DB as DB
+
+    S->>L: submit(execution, definition)
+    L->>D: resources_for(definition)
+    D-->>L: ResourceHint(memory_mb, cpu, wall_clock, queue?)
+    L->>DB: allocate fragment + register_datasets
+    L->>DB: session.expunge + commit
+    Note over L: deadline = clock() + resources.wall_clock
+    L->>T: dispatch(ExecutionEnvelope)
+
+    Note over T,W: sbatch · qsub · pool.submit · celery send · inline
+    T->>W: hand off envelope
+    activate W
+    W->>W: diagnostic.run(definition)
+    W->>W: _BundleWriter.write (output.json, diagnostic.json, series.json)
+    W->>W: CV.validate (hard-fail)
+    W->>W: capture Telemetry (duration, peak_rss_mb, host)
+    W-->>T: ExecutionOutcome
+    deactivate W
+
+    S->>L: drain(timeout)
+    loop until no in-flight executions
+        L->>T: poll(block, timeout)
+        T-->>L: ExecutionOutcome
+        Note over L: _finalize(outcome)
+        L->>DB: session.merge(execution_id)
+        L->>DB: _Promoter.copy(scratch → results)
+        Note over L: _Classifier → SUCCESS | RETRY | GIVE_UP
+        L->>DB: _Ingestor.upsert(outputs, scalars, series)
+        L->>DB: _DirtyRule.apply(decision)
+        L->>DB: execution.telemetry = outcome.telemetry
+        L->>DB: mark_successful / mark_failed
+    end
 ```
 
 ## Retry classification
@@ -582,18 +588,37 @@ Mitigations:
 Three designs were considered in detail.
 Sketches and trade-offs follow; the chosen design is a deliberate hybrid.
 
+```mermaid
+quadrantChart
+    title Design trade-off space
+    x-axis "Surface area (concepts)" --> "Larger"
+    y-axis "Defaults baked in" --> "More"
+    quadrant-1 "Heavy & opinionated"
+    quadrant-2 "Lean & opinionated"
+    quadrant-3 "Lean & open"
+    quadrant-4 "Heavy & open"
+    "A - Minimal": [0.18, 0.55]
+    "B - Maximally flexible": [0.92, 0.18]
+    "C - Common-case optimised": [0.38, 0.92]
+    "Hybrid (chosen)": [0.42, 0.7]
+```
+
+Comparison at a glance (relative scale, 0–5):
+
+| Dimension              | A — Minimal | B — Maximal | C — Common-case | Hybrid (chosen) |
+|------------------------|:-:|:-:|:-:|:-:|
+| Public surface         | 1 | 5 | 2 | 2 |
+| Defaults baked in      | 3 | 1 | 5 | 4 |
+| Bend without editing   | 3 | 5 | 2 | 3 |
+| Migration churn        | 4 | 5 | 2 | 3 |
+| Resource-hint support  | 0 | 5 | 0 | 5 |
+| Speculation tax        | 0 | 3 | 0 | 1 |
+
 ## A — Minimal interface (rejected as a pure form)
 
 Two public methods (`submit`, `drain`), one Protocol (`Transport`).
 Everything else collapses behind the facade and cannot be customised
 without editing the module.
-
-```
-Public surface:   ████░░░░░░░░░░░░░░░░  (smallest)
-Defaults baked:   ████████░░░░░░░░░░░░
-Future bend:      ██████████░░░░░░░░░░  (one port + edit-in-place)
-Migration churn:  ████████████████░░░░  (deletes Executor Protocol)
-```
 
 Strength: minimal cognitive load. Weakness: no place to declare
 resource hints, no place for per-provider retry policies; both end up
@@ -605,14 +630,6 @@ Five ports (`Transport`, `ArtifactStore`, `RetryPolicy`, `IngestSink`,
 `FragmentAllocator`), seven lifecycle hooks, plugin discovery via entry
 points, schema-versioned wire types.
 
-```
-Public surface:   ████████████████████  (5 ports × N methods + 7 hooks)
-Defaults baked:   ████░░░░░░░░░░░░░░░░  (everything injectable)
-Future bend:      ████████████████████  (port-shaped for K8s/S3/Prom)
-Migration churn:  ████████████████████  (new wire format + plugin registry)
-Speculation tax:  ██████████░░░░░░░░░░  (hooks + FragmentAllocator-as-port)
-```
-
 Strength: every anticipated future requirement has a seam already.
 Weakness: heavy speculation tax — five ports without five concrete
 implementations driving them is exactly the shape that calcifies into
@@ -622,14 +639,6 @@ implementations driving them is exactly the shape that calcifies into
 
 One class with `dispatch`, `drain`, plus `replay_abandoned`, `dry_run`,
 `ingest`, `with_transport`. Sensible defaults sourced from `Config`.
-
-```
-Public surface:   ████████░░░░░░░░░░░░  (1 hot method + 4 cold methods)
-Defaults baked:   ████████████████████  (highest)
-Future bend:      ████████░░░░░░░░░░░░  (single port; widen kwargs)
-Migration churn:  ██████░░░░░░░░░░░░░░  (smallest; adapters survive)
-Hidden leak:      ████░░░░░░░░░░░░░░░░  (Celery ignores on_done callback)
-```
 
 Strength: the solver call site collapses to one line per iteration.
 Weakness: a `ResultSink` callback that Celery silently ignores is an
