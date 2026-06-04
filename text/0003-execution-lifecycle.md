@@ -3,502 +3,502 @@
 - RFC PR: [Climate-REF/rfcs#0003](https://github.com/Climate-REF/rfcs/pull/3)
 
 # Summary
+[summary]: #summary
 
-Consolidate the lifecycle of one diagnostic execution
-— allocation, dispatch, run, classify, publish, ingest, finalise —
-into one deep module (`ExecutionLifecycle`) behind one `Transport` port.
-Add a declarative `ResourceHint` on every `Diagnostic`
-and capture per-execution `Telemetry`,
-so providers can express memory / CPU / wall-clock once
-and future schedulers (SLURM, PBS, K8s)
-plug in as thin adapters that only translate the envelope
-and poll job state.
+Replace the shallow `Executor` protocol and its three divergent implementations
+(`SynchronousExecutor`, `LocalExecutor`, `CeleryExecutor`)
+with one execution lifecycle built on two ideas.
+
+1. A self-describing, on-disk **execution manifest** (`execution.json`)
+   that records — in CMEC-compatible terms — what an execution *is* and how it *ended*.
+2. A thin **`Transport`** port that only *launches* work and reports *liveness*
+   (`RUNNING | EXITED | GONE`).
+
+Results never travel back through the transport.
+Every execution method — in-process, process pool, Celery, SLURM, PBS —
+completes by writing its CMEC bundles to a directory on disk,
+and a single, transport-agnostic *ingest* step loads the manifest and bundles into the database.
+
+This makes executions crash-robust and replayable,
+makes diagnostic output self-describing so it can be compared across runs and versions (regression),
+and reduces every backend to a launcher plus a status query.
 
 # Motivation
+[motivation]: #motivation
 
-The lifecycle of one execution is currently fragmented across ~8 files
-in 2 packages.
-A single happy-path run touches
-`solver.py` (allocates row + fragment, register_datasets, expunge, commit),
-`climate_ref_core/executor.py` (`execute_locally`, `_is_system_error`,
-`CondaCommandError` handling),
-`climate_ref_core/diagnostics.py` (`ExecutionResult.build_from_output_bundle`,
-a static factory that writes three JSON files to disk as a side effect of
-constructing the result),
-`climate_ref/executor/result_handling.py` (scratch→results copy ×4,
-ingestion in nested-tx, dirty-flag toggled in 3 branches of the result path),
-`climate_ref/executor/fragment.py` (PLACEHOLDER_FRAGMENT, group_short),
-and one of `synchronous.py` / `local.py` / `climate_ref_celery/executor.py`
-(each reimplementing the same reattach / commit / mark dance).
+The REF needs **one robust way to run diagnostics** that works across a range of deployments —
+a laptop, a Celery cluster, and an HPC batch scheduler at a modelling centre.
+"Robust" has a concrete meaning here:
+an execution survives coordinator and worker crashes cleanly,
+and an operator can always see *what a run did and why it failed* from durable state, not from a live process.
 
-Concrete consequences today:
+Today none of that holds, for four reasons.
 
-- **Providers have no place to declare parallelisation hints.**
-  ESMValTool diagnostics that need 16 GB or 8 h have nowhere to say so;
-  `LocalExecutor` applies one 6 h per-task timeout to every diagnostic
-  (a single constructor default, not per-diagnostic),
-  `CeleryExecutor` enforces no per-task timeout at all,
-  and a future SLURM/PBS adapter has nothing to translate into `sbatch`/`qsub`.
-- **Retry classification is scattered** across `_is_system_error`,
-  the `CondaCommandError` branch, missing-log handling, `LocalExecutor`'s
-  per-task timeout, and pool-shutdown abandonment.
-- **The `dirty` flag is decided in three branches of the result path**
-  (success path, non-retryable failure, retryable failure / missing log).
-  User-initiated `dirty=True` resets in `cli/executions.py` (rerun / reset)
-  are deliberately separate and stay outside the consolidated rule.
-- **CV validation is silenced** (`logger.warning` with TODO instead of raising).
-- **Tests mock subprocess + filesystem + DB + Celery** and import private
-  helpers (`_is_system_error`) to compensate for the missing seam.
-- **`ExecutionResult` construction is entangled with disk I/O.**
-  It already pickles across the `ProcessPoolExecutor` boundary today
-  (`_process_run` returns it to the parent), so picklability is not the
-  problem — the problem is that the factory cannot be exercised without a
-  writable output directory, which forces filesystem fixtures into every
-  unit test that builds a result.
+## The lifecycle is fragmented across divergent executors
 
-The CMIP REF is approaching deployment targets (SLURM / PBS / K8s).
-The recurring lifecycle logic — fragment allocation, the reattach / commit /
-mark dance, scratch→results promotion, retry classification — is already
-shared in `result_handling.py`; what each new transport reimplements is the
-dispatch / poll / timeout wiring around it.
-This RFC pulls that shared logic behind one seam so a transport contributes
-only its dispatch and poll, not a copy of the lifecycle.
-This RFC is **not** about replacing SLURM, PBS, K8s, or Celery as schedulers.
-It is about defining a single robust seam *above* them.
+A single happy-path run touches eight files in two packages:
+
+- `solver.py` allocates the row and fragment,
+  registers datasets, expunges, and commits before handing off to an executor.
+- `climate_ref_core/executor.py` holds `execute_locally`, `_is_system_error`,
+  and the `CondaCommandError` branch.
+- `climate_ref_core/diagnostics.py` holds `ExecutionResult.build_from_output_bundle`,
+  a static factory that writes three JSON files to disk as a side effect of constructing the result.
+- `climate_ref/executor/result_handling.py` copies scratch→results, ingests inside a nested transaction,
+  and toggles the `dirty` flag in three branches.
+- One of `synchronous.py` / `local.py` / `climate_ref_celery/executor.py`
+  re-implements the reattach / commit / mark dance.
+
+The three executors diverge in ways that matter:
+`LocalExecutor` applies a single 6-hour per-task timeout to every diagnostic;
+`CeleryExecutor` enforces no per-task timeout at all;
+`SynchronousExecutor` runs inline.
+Retry classification is scattered across `_is_system_error`, the `CondaCommandError` branch,
+missing-log handling, the per-task timeout path, and pool-shutdown abandonment.
+
+## Executions are not robust to crashes
+
+Failure state is decided from a *live* exception in `execute_locally` and recorded only in the database.
+If a worker is OOM-killed, the coordinator dies mid-drain, or a Celery broker is lost,
+there is no durable record on disk of what the execution was or how far it got.
+The `LocalExecutor` join loop marks abandoned futures retryable from memory;
+once that process is gone, the knowledge is gone.
+An operator inspecting a stuck `Execution` row (`successful IS NULL`)
+cannot tell whether it is still running or died hours ago.
+
+## Results are not self-describing
+
+An execution directory today contains the CMEC output bundle (`output.json`),
+the CMEC diagnostic bundle (`diagnostic.json`), the series values (`series.json`), and a log (`out.log`).
+**Nothing on disk says which diagnostic, provider version, or datasets produced them** —
+that identity lives only in the database, and `reingest` rebuilds it *from* the database.
+This blocks the primary motivation for this RFC: **regression output**.
+To compare a diagnostic's output across versions or runs,
+or to re-ingest results after changing extraction logic,
+the result directory must carry its own identity and outcome.
+It also blocks any future where a directory is copied between deployments.
+
+## There is no seam for HPC
+
+Modelling centres run on SLURM and PBS.
+There is nowhere for a diagnostic to declare it needs 16 GB or 8 hours,
+and nothing a batch adapter could translate into `sbatch --mem --time` or `qsub -l`.
+Each new backend would otherwise re-implement the whole lifecycle inline.
+
+**Primary driver: regression output and crash-robustness.**
+HPC reach and cross-deployment portability are downstream beneficiaries of the same on-disk format,
+not the justification on their own.
 
 # Reference-level explanation
+[reference-level-explanation]: #reference-level-explanation
 
-## Module boundary
+## Two verbs: `run` and `ingest`
 
-```mermaid
-classDiagram
-    direction LR
+The lifecycle splits cleanly into two operations that today are tangled together.
 
-    class ExecutionLifecycle {
-        <<climate_ref.lifecycle>>
-        +submit(execution, definition)
-        +drain(timeout) None
-        +replay_abandoned() list~int~
-        -_FragmentAllocator
-        -_Classifier
-        -_Promoter
-        -_Ingestor
-        -_DirtyRule
-        -_BundleWriter
-    }
+- **`run`**: turn an `ExecutionDefinition` into an output directory on disk —
+  a manifest plus CMEC bundles. A `Transport` drives this (or, in future, an external system does).
+- **`ingest`**: load one output directory into the database. Transport-agnostic, idempotent, replayable.
 
-    class Transport {
-        <<Protocol>>
-        +name: ClassVar~str~
-        +dispatch(envelope: ExecutionEnvelope) None
-        +poll(block, timeout) Iterator~ExecutionOutcome~
-        +shutdown(timeout) None
-    }
+Every execution method funnels through the same `ingest`.
+Live completion, re-ingestion after a logic change, and (future) cross-deployment import
+are the *same code path* reading the *same on-disk format*.
 
-    class InMemoryTransport { tests + SynchronousExecutor }
-    class ProcessPoolTransport { replaces LocalExecutor }
-    class CeleryTransport { climate-ref-celery }
-    class SlurmTransport { future · sbatch --mem --cpus --time }
-    class PbsTransport { future · qsub -l mem,ncpus,walltime }
-    class K8sTransport { future · pod resources + deadline }
+## The execution manifest (`execution.json`)
 
-    ExecutionLifecycle ..> Transport : dispatch / poll
-    InMemoryTransport ..|> Transport
-    ProcessPoolTransport ..|> Transport
-    CeleryTransport ..|> Transport
-    SlurmTransport ..|> Transport
-    PbsTransport ..|> Transport
-    K8sTransport ..|> Transport
+A REF-owned, typed, versioned file written to the execution directory.
+It is the durable record of an execution's identity and outcome.
+CMEC provides building blocks for *provenance* but has no vocabulary for *outcome*,
+so the manifest is a REF schema that embeds CMEC provenance rather than living inside the CMEC output bundle.
+
+```python
+class ManifestStatus(enum.Enum):
+    SUCCESS     = "success"      # ran; produced a valid, CV-checkable bundle
+    FAILED      = "failed"       # ran; diagnostic logic error — not retryable (give up)
+    RECOVERABLE = "recoverable"  # ran; system/transient error — retryable
+
+@attrs.frozen
+class DatasetRef:
+    instance_id: str             # Dataset.slug — the CMIP6 instance_id; assumed globally unique
+    slug_column: str
+    source_type: str             # SourceDatasetType: cmip6, obs4mips, ...
+
+@attrs.frozen
+class Outcome:                   # phase 2 — written when the diagnostic ends
+    status: ManifestStatus
+    exit_code: int | None
+    started_at: datetime
+    finished_at: datetime
+    output_bundle: str | None    # output.json     — CMEC output bundle (CMECOutput)
+    metric_bundle: str | None    # diagnostic.json  — CMEC diagnostic bundle (CMECMetric)
+    series: str | None           # series.json
+    log: str = "out.log"
+    provenance: OutputProvenance | None = None   # CMEC environment / modeldata / obsdata / log
+
+@attrs.frozen
+class ExecutionManifest:
+    schema_version: int
+    # --- identity: phase 1, written before the diagnostic runs ---
+    diagnostic_slug: str
+    diagnostic_version: int
+    provider_slug: str
+    provider_version: str
+    dataset_hash: str
+    datasets: list[DatasetRef]
+    selectors: dict[str, str]
+    # --- outcome: phase 2 ---
+    outcome: Outcome | None = None   # None ⇒ incomplete (in-flight, or hard-killed before writing)
 ```
 
-## Wire types
+**Two-phase write.**
+The identity half is the *first* file written to the directory, before the diagnostic runs,
+with `outcome = None`.
+The outcome half is the *last* thing the worker writes, **even on a recoverable failure**.
+Therefore a manifest with `outcome is None` means *incomplete*:
+either still in flight, or hard-killed (OOM, `SIGKILL`, node loss) before it could write its epitaph.
+This single invariant is what makes crashes diagnosable from disk alone.
 
-Picklable value objects only. No DB sessions, `Config`, or CV cross the boundary.
+**CMEC alignment.**
+`provenance` reuses the CMEC `OutputProvenance` shape (`environment`, `modeldata`, `obsdata`, `log`),
+so the manifest captures inputs and environment in standard terms.
+`datasets` references inputs by `instance_id` (the CMEC/ESGF dataset identity),
+which is what makes a directory portable: it names its inputs without carrying them.
 
-`ResourceHint` lives in `climate_ref_core` (the `Diagnostic` base class
-declares it, and core cannot import the application package).
-`ExecutionEnvelope`, `Telemetry`, `ExecutionOutcome`, and the `Transport`
-protocol live in `climate_ref.lifecycle` alongside `ExecutionLifecycle`.
+## The `Transport` port — liveness, not results
 
-The default `wall_clock` is **6 h**, matching today's `LocalExecutor`
-per-task timeout, so diagnostics that run for hours without declaring
-`resources` keep their current budget (Celery enforces no limit today, so
-nothing regresses there either). Tightening the default is a separate,
-explicit decision.
+A transport launches an execution and answers one question: *is it alive?*
+It never carries results.
+
+```python
+class Status(enum.Enum):
+    RUNNING = "running"   # still executing
+    EXITED  = "exited"    # ended with a clean exit code
+    GONE    = "gone"      # vanished without a clean exit (OOM, SIGKILL, node loss, timeout-kill)
+
+class Transport(Protocol):
+    name: ClassVar[str]
+    def dispatch(self, envelope: ExecutionEnvelope) -> str: ...        # launch; return durable handle
+    def status(self, handles: Mapping[int, str]) -> Mapping[int, Status]: ...
+    def cancel(self, handle: str) -> None: ...                         # deadline / drain kill
+    def shutdown(self, timeout: float) -> None: ...
+```
+
+`dispatch` returns a durable handle (pid, Celery task id, SLURM job id)
+that the lifecycle persists on the `Execution` row in the same commit,
+so a freshly restarted coordinator can still ask about the job.
 
 ```python
 @attrs.frozen
 class ResourceHint:
     memory_mb: int = 4096
     cpu: int = 1
-    wall_clock: timedelta = timedelta(hours=6)   # matches current LocalExecutor budget
-    queue: str | None = None    # transport-specific routing tag
+    wall_clock: timedelta = timedelta(hours=6)   # matches today's LocalExecutor budget
+    queue: str | None = None                     # transport-specific routing tag
 
 @attrs.frozen
 class ExecutionEnvelope:
     execution_id: int
     definition: ExecutionDefinition
     resources: ResourceHint
-    # wall_clock travels in `resources`; the *deadline* is computed by the
-    # transport when the job starts running, not here — a queued SLURM/PBS
-    # job may wait hours before it begins, so anchoring the deadline at
-    # submit time would expire jobs before they start.
-
-@attrs.frozen
-class Telemetry:
-    duration: timedelta
-    peak_rss_mb: int | None
-    host: str
-    exit_code: int | None
-    transport_meta: Mapping[str, str]   # slurm jobid / k8s pod / celery task_id
-
-@attrs.frozen
-class ExecutionOutcome:
-    execution_id: int
-    result: ExecutionResult | None       # None ⇒ transport-side abandonment
-    failure: ExecutionFailure | None     # timeout | broker_lost | pool_shutdown
-    telemetry: Telemetry
+    # wall_clock travels inside `resources`; the deadline is computed by the transport
+    # (or the scheduler) at job *start*, never at submit time — a queued SLURM/PBS job
+    # may wait hours before it begins.
 ```
 
-`ExecutionResult` becomes pure data.
-The current `build_from_output_bundle` factory is split into a pure
-`ExecutionResult.from_bundle(definition, bundle)` and a worker-side
-`_BundleWriter.write(definition, bundle)` that owns the JSON I/O.
+The default `wall_clock` is 6 h to match today's `LocalExecutor` budget,
+so diagnostics that run for hours without declaring `resources` keep their current allowance.
 
-## Diagnostic-side declaration
+## The lifecycle and the drain loop
 
-```python
-class Diagnostic(AbstractDiagnostic):
-    resources: ResourceHint = ResourceHint()        # project-wide default
-
-    def resources_for(self, definition: ExecutionDefinition) -> ResourceHint:
-        """Optional per-execution sizing. Default returns self.resources."""
-        return self.resources
-
-
-# Examples
-class ESMValToolDiagnostic(CommandLineDiagnostic):
-    resources = ResourceHint(memory_mb=16000, cpu=4, wall_clock=timedelta(hours=6))
-
-class EnsoDiagnostic(Diagnostic):
-    resources = ResourceHint(memory_mb=24000, cpu=8,
-                             wall_clock=timedelta(hours=8), queue="bigmem")
-
-class IlambDiagnostic(Diagnostic):
-    resources = ResourceHint(memory_mb=8000, cpu=2, wall_clock=timedelta(hours=2))
-    def resources_for(self, defn):
-        n = len(defn.datasets.get_cmip6())
-        return attrs.evolve(self.resources, memory_mb=8000 + 500 * n)
-```
-
-## Solver dispatch — before and after
+`ExecutionLifecycle` is one deep module that owns submission, the drain loop, retry/dirty, and ingest.
+It is stateless with respect to in-flight work:
+the set of executions to wait on comes from the database (`successful IS NULL`), not from memory.
+This is what makes it re-runnable and crash-safe — `drain` after a restart simply resumes.
 
 ```python
-# Before: ~50 lines of bookkeeping in solver.py:709-757
-#   PLACEHOLDER_FRAGMENT, assign_execution_fragment, attrs.evolve,
-#   register_datasets, expunge, commit, executor.run, … executor.join
-
-# After:
-lifecycle = ExecutionLifecycle(config, db, transport)
-
 for group, datasets, definition in planned_executions:
     execution = Execution(execution_group=group, dataset_hash=datasets.hash,
                           provider_version=definition.diagnostic.provider.version)
-    lifecycle.submit(execution, definition)
+    lifecycle.submit(execution, definition)   # writes phase-1 manifest, dispatch(), persists handle
 
 lifecycle.drain(timeout=timeout)
 ```
 
-## End-to-end sequence
+`drain` loops over the in-flight set.
+**The transport decides liveness; the manifest decides outcome;
+a present manifest outcome wins over liveness.**
+
+```python
+for ex in db.in_flight(submitted):                  # successful IS NULL
+    match transport.status({ex.id: ex.handle})[ex.id]:
+        case Status.RUNNING:
+            if past_deadline(ex):
+                transport.cancel(ex.handle)         # ProcessPool only; schedulers self-kill
+            # else: keep waiting
+
+        case Status.EXITED:                          # clean exit — ask the disk what it meant
+            outcome = read_manifest(ex.dir).outcome
+            if outcome is None:                      # exited 0 but wrote no outcome → incomplete
+                mark_retryable(ex)
+            elif outcome.status is SUCCESS:
+                ingest_from_disk(ex.dir)             # CV-validated; same path for every transport
+            elif outcome.status is FAILED:
+                mark_failed(ex)                      # diagnostic error, give up
+            else:                                    # RECOVERABLE
+                mark_retryable(ex)
+
+        case Status.GONE:                            # no clean exit
+            outcome = read_manifest(ex.dir).outcome  # worker may have logged a recoverable fail first
+            if outcome is None:
+                mark_retryable(ex)                   # hard crash: OOM / SIGKILL / node loss
+            else:
+                apply(outcome)                        # manifest wins (e.g. SUCCESS written then node reaped)
+```
+
+The decisive robustness rule is the last branch:
+if the worker wrote `SUCCESS` and the node then died before the scheduler reaped it,
+the transport reports `GONE` but the manifest reports success — and the manifest wins.
+Transport liveness only adjudicates the *no-manifest-outcome* case.
+
+## Execution states
 
 ```mermaid
-sequenceDiagram
-    autonumber
-    participant S as Solver
-    participant D as Diagnostic
-    participant L as ExecutionLifecycle
-    participant T as Transport
-    participant W as Worker
-    participant DB
+stateDiagram-v2
+    [*] --> Planned: solver creates Execution (successful=NULL)
+    Planned --> Dispatched: transport.dispatch()<br/>phase-1 manifest written
+    Dispatched --> Running: worker starts
 
-    S->>L: submit(execution, definition)
-    L->>D: resources_for(definition)
-    D-->>L: ResourceHint(...)
-    L->>DB: allocate fragment + register_datasets + expunge + commit
-    L->>T: dispatch(ExecutionEnvelope)
+    Running --> Running: status=RUNNING, within deadline
+    Running --> Gone: status=RUNNING, past deadline<br/>transport.cancel()
 
-    Note over T,W: sbatch · qsub · pool.submit · celery send · inline
-    Note over T: deadline = job_start + resources.wall_clock (transport-side)
-    T->>W: hand off envelope
-    activate W
-    W->>W: diagnostic.run · _BundleWriter.write · CV.validate · Telemetry
-    W-->>T: ExecutionOutcome
-    deactivate W
+    state poll <<choice>>
+    Running --> poll: status=EXITED
+    Running --> Gone: status=GONE
+    Gone --> poll: read manifest
 
-    S->>L: drain(timeout)
-    loop until no in-flight executions
-        L->>T: poll(block, timeout)
-        T-->>L: ExecutionOutcome
-        Note over L: _Classifier → SUCCESS | RETRY | GIVE_UP
-        L->>DB: merge · promote artifacts · upsert outputs/scalars/series
-        L->>DB: _DirtyRule.apply · save telemetry · mark_*
-    end
+    poll --> Ingesting: manifest.outcome = SUCCESS<br/>(wins even if GONE)
+    poll --> Failed: manifest.outcome = FAILED<br/>(diagnostic error)
+    poll --> Retryable: manifest.outcome = RECOVERABLE
+    poll --> Retryable: manifest.outcome absent<br/>(incomplete / OOM / SIGKILL)
+
+    Ingesting --> Successful: bundles→DB, CV-validated<br/>successful=True, group.dirty=False
+    Ingesting --> Retryable: ingest error
+
+    Successful --> [*]
+    Failed --> [*]: successful=False, group.dirty=False
+    Retryable --> [*]: successful=False, group.dirty=True<br/>→ new Execution next solve
+
+    note right of Dispatched
+        External/Null transport (future):
+        no status channel — status is
+        derived from manifest presence
+    end note
 ```
 
-## Retry + dirty rule (one source of truth)
+A row has three terminal outcomes:
+**Successful** (clean, group marked clean);
+**Failed** (diagnostic error, not retryable, group marked clean);
+**Retryable** (system/transient error or hard crash — the group stays dirty, and the next solve mints a *new*
+`Execution`).
+A retry never re-runs the same row.
 
-Classification happens in two clearly separated places.
+## Retry and dirty: two clearly separated decisions
 
-**Worker side** — exception → outcome. The worker runs the diagnostic and
-maps the raised exception (or clean return) onto the booleans carried by
-`ExecutionResult` / `ExecutionFailure`. This is where the exception-type
-knowledge lives, because the exception is only ever raised on the worker:
+Classification happens in two places, and only two.
+
+**Worker side — exception → outcome.**
+The worker maps the raised exception (or a clean return) onto `ManifestStatus` and writes it to the manifest.
+This is the one place that knows exception *types*, because the exception is only ever raised on the worker.
+It consolidates the logic spread today across `_is_system_error` and the `CondaCommandError` branch:
 
 ```python
-# worker-side, inside the run path
-SYSTEM_ERRORS = (OSError, MemoryError, SystemExit, KeyboardInterrupt)  # → retryable
-NON_RETRYABLE = (CondaCommandError,)                                   # → give up
+SYSTEM_ERRORS = (OSError, MemoryError, SystemExit, KeyboardInterrupt)  # → RECOVERABLE
+NON_RETRYABLE = (CondaCommandError,)                                   # → FAILED
 ```
 
-This consolidates the exception-classification logic that is **today**
-spread across `_is_system_error` and the separate `CondaCommandError`
-branch in `execute_locally` into one worker-side function.
+**Coordinator side — outcome → decision.**
+The drain loop maps the already-classified outcome (plus transport liveness) onto `SUCCESS | retry | give up`.
+It never inspects exception types, so it behaves identically for every transport,
+including remote ones where the exception object never comes back.
 
-**Coordinator side** — outcome → decision. The policy never inspects
-exception types; it maps the already-classified outcome onto a decision,
-so the same rule applies identically to every transport (including remote
-ones where the exception object never comes back):
+The `dirty` flag follows directly:
+`SUCCESS` and `FAILED` clear it; `RECOVERABLE` and incomplete leave it set so the next solve retries.
+User-initiated `dirty = True` resets in `cli/executions.py` (rerun / reset) stay separate by design.
 
-```python
-class RetryDecision(enum.Enum):
-    SUCCESS = "success"
-    RETRY   = "retry"     # leaves dirty=True
-    GIVE_UP = "give_up"   # sets dirty=False, marks failed
+## Ingest from disk
 
-class DefaultRetryPolicy:
-    def classify(self, outcome: ExecutionOutcome) -> RetryDecision:
-        if outcome.failure is not None:  # timeout | broker_lost | pool_shutdown
-            return RetryDecision.RETRY
-        r = outcome.result
-        if r is None:                    return RetryDecision.RETRY
-        if r.successful:                 return RetryDecision.SUCCESS
-        return RetryDecision.RETRY if r.retryable else RetryDecision.GIVE_UP
-```
+`ingest_from_disk(directory)` reads `execution.json` and the bundles it names, then writes to the database.
+It is the only path that mutates result tables, and it is:
 
-Net effect: exception classification goes from two scattered sites to one
-worker-side function, and the *transport-level* outcomes that today live in
-the per-executor `join` loops (missing log, per-task timeout, pool-shutdown
-abandonment) collapse into the single coordinator policy above.
+- **Idempotent.** Inserts use `ON CONFLICT DO NOTHING` on natural keys
+  (`(execution_id, output_type, short_name)` for outputs;
+  `(execution_id, dimensions_hash[, index_name])` for diagnostic and series values).
+  Each solve mints a new `execution_id` per attempt, so retries never collide;
+  the conflict clause only guards re-ingestion of the *same* execution during a replay or eager/poll race.
+- **CV-validated.** The CMEC diagnostic and series bundles are validated against the controlled vocabulary
+  at ingest, exactly as today. (This RFC keeps the current `logger.warning` behaviour;
+  making CV a hard failure is explicitly out of scope — see below.)
+- **Portable.** Result directories hold results only, with relative internal paths.
+  Inputs are referenced by `instance_id` and resolved against the importing deployment's dataset index;
+  a directory never carries or hardcodes input data.
 
-## Idempotent ingest, telemetry
+This is also what enables the existing `reingest` use case to work *without* the database it was produced from
+(within limits — see portability tiers under Unresolved questions).
 
-Ingestion uses `INSERT … ON CONFLICT DO NOTHING` on natural keys
-(`(execution_id, output_type, short_name)` for outputs,
-`(execution_id, dimensions_hash[, index_name])` for metric/series values),
-so `replay_abandoned()` is safe.
-Scratch-to-results copy uses `exist_ok=True`.
+## Transports
 
-`DO NOTHING` (rather than `DO UPDATE`) is correct because every key is
-scoped to `execution_id`, and each solve mints a **new** `Execution` row per
-attempt: a retry produces a fresh `execution_id`, so its values never
-collide with the abandoned attempt's. The conflict clause therefore only
-guards re-ingestion of the *same* `execution_id` during replay — it never
-silently keeps stale values from a previous attempt.
+All current executors are replaced, and the two HPC backends are added, as part of this work.
+Each is a launcher plus a status query — typically under a few hundred lines.
 
-New `Execution` columns: `duration_seconds`, `peak_rss_mb`, `telemetry_meta JSON`.
-No solver code reads these today; they exist so a future adaptive
-`ResourceProvider` is a feature addition rather than a schema migration.
+| Transport             | Replaces / adds        | `dispatch`            | `status` source         | deadline enforced by      |
+|-----------------------|------------------------|-----------------------|-------------------------|---------------------------|
+| `InMemoryTransport`   | `SynchronousExecutor`  | run inline            | always `EXITED`         | n/a (inline)              |
+| `ProcessPoolTransport`| `LocalExecutor`        | `pool.submit`         | `future` state          | coordinator (`cancel`)    |
+| `CeleryTransport`     | `CeleryExecutor`       | `app.send_task`       | `AsyncResult`           | broker (`task_time_limit`)|
+| `SlurmTransport`      | new                    | `sbatch --mem --time` | `sacct` / `squeue`      | scheduler (`--time`)      |
+| `PbsTransport`        | new                    | `qsub -l`             | `qstat`                 | scheduler (walltime)      |
 
-## Test impact
+`ProcessPoolTransport` is the only transport that enforces the deadline coordinator-side
+(via `cancel` → `future.cancel`), because there is no external scheduler to do it;
+this preserves today's `LocalExecutor` per-task timeout.
 
-Delete: `_is_system_error` private-import tests,
-subprocess patch chains in `test_providers.py`,
-per-executor reattach tests,
-`mark_execution_failed` mock chains.
+**Celery callback demotes to a latency optimisation.**
+Today `CeleryExecutor` attaches `link` / `link_error` callbacks (`handle_result` / `handle_failure`)
+that ingest worker-side.
+Under this design the worker writes its bundle and manifest to disk like every other transport,
+and the coordinator (or a resident orchestrator running `drain`) ingests from disk.
+The `link` callback may be kept as an *eager-ingest hook* — "ingest this directory now" rather than at the next
+poll — but it is no longer load-bearing: if the callback is lost, the disk scan recovers the result.
+This dissolves the previous push-vs-pull asymmetry; both modes run the same `ingest_from_disk`.
 
-Add boundary tests against `ExecutionLifecycle` + `InMemoryTransport`:
-unique fragment per submit;
-end-to-end success → `dirty=False`;
-retryable failure leaves `dirty=True`;
-non-retryable failure → `dirty=False`, `successful=False`;
-re-drain idempotent (no double-insert);
-`wall_clock` enforced uniformly across transports;
-CV mismatch raises `ResultValidationError`;
-`replay_abandoned` returns stranded IDs.
+## Migration plan
+
+The cutover replaces the seam the solver calls, so it lands in stages, each independently shippable:
+
+1. **Manifest, additively.** Current executors start writing `execution.json` (both phases).
+   No behaviour change; result directories become self-describing immediately —
+   this alone unlocks regression comparison.
+2. **Seam + local transports.** Introduce `ExecutionLifecycle`, the `Transport` port, `ingest_from_disk`,
+   and `InMemoryTransport` + `ProcessPoolTransport`; route the solver through the lifecycle.
+3. **Celery.** Port to `CeleryTransport`; convert `link`/`link_error` to the optional eager-ingest hook.
+4. **HPC.** Add `SlurmTransport` and `PbsTransport`.
+5. **Cleanup.** Delete the `Executor` protocol and the three old executors once nothing imports them.
+
+`import_executor_cls` (which resolves an executor from a dotted path in `Config`) gains a deprecation cycle:
+known names map to the new transports, custom dotted paths warn, and a config-migration note ships with step 5.
 
 # Drawbacks
+[drawbacks]: #drawbacks
 
-- **Celery loses fire-and-forget ingestion — the biggest trade-off.**
-  Today `CeleryExecutor` attaches `link` / `link_error` callbacks
-  (`handle_result` / `handle_failure`) so a worker ingests its own result
-  with no live coordinator; the submitting process can exit immediately.
-  The pull model (`Transport.poll` feeding `drain`) couples ingestion to a
-  coordinator that stays alive for the whole batch. This is a real
-  regression for the distributed case and is accepted deliberately: it buys
-  one ingestion path and uniform retry/dirty handling across transports,
-  and `replay_abandoned` (backed by `CeleryTransport` persisting task IDs
-  alongside execution IDs) recovers a coordinator crash mid-drain. If
-  detached submission turns out to be a hard requirement, a worker-side
-  `IngestSink` callback can be added later without changing the seam — but
-  the draft does **not** preserve it, and reviewers should weigh that.
-- **Migration is wide and the seam swap is atomic.** Staggering applies to
-  *adding* transports later, not to the cutover: `climate-ref-core` (wire
-  types, `ResourceHint` on `Diagnostic`), `climate-ref`
-  (`ExecutionLifecycle`, the transports), `climate-ref-celery`, and an
-  Alembic migration all land together, because the seam replaces the
-  `Executor` protocol the solver calls. Proposed landing order to bound
-  risk: (1) add `ResourceHint` + telemetry columns (additive, no behaviour
-  change); (2) introduce `ExecutionLifecycle` + `InMemoryTransport` +
-  `ProcessPoolTransport` behind the existing solver entry point with the old
-  executors still present; (3) port Celery; (4) delete the old executors.
-- **Deleting the `Executor` protocol is a breaking public change.**
-  `import_executor_cls` resolves an executor from a dotted path in `Config`,
-  so the executor class is a documented extension point and any downstream
-  custom executor implements it. The cutover must ship a deprecation cycle:
-  keep `import_executor_cls` resolving known names to the new transports,
-  warn on custom FQNs, and provide a config-migration note. This is not yet
-  spelled out and is a precondition for merge.
-- **CV becomes hard-fail.** Today's silent `logger.warning` becomes a
-  raise. Intentional, but needs a one-cycle deprecation window where
-  the violation is `ERROR` but not raised — and it ships in the same wide
-  migration as the seam swap, so it must be feature-flagged to keep the two
-  behaviour changes independently bisectable.
-- **One fat class (~400–500 LOC).** Intentional depth, but reviewers
-  should expect a large file. (LOC is an estimate, not a target.)
-- **Resource hints can be wrong.** SLURM will OOM-kill a job whose
-  declared memory is too low. Mitigated by a default that preserves current
-  behaviour (4 GB / 1 CPU / 6 h), by `ProcessPoolTransport` ignoring
-  everything except `wall_clock`, and by telemetry capture making the first
-  failed run actionable.
+- **The migration is wide.** The seam the solver calls is replaced, touching `climate-ref-core`,
+  `climate-ref`, and `climate-ref-celery`. The staging above bounds the risk but does not remove it.
+- **One deep module.** `ExecutionLifecycle` is intentionally a large, central class.
+  Reviewers should expect depth concentrated in one file rather than spread thinly.
+- **A resident coordinator is needed for steady-state ingest.**
+  With the callback demoted, ingest normally runs in the process that calls `drain`
+  (the CLI, or a resident orchestrator). The eager-ingest hook keeps Celery's low latency,
+  but the fire-and-forget-with-no-coordinator mode is gone unless the hook is retained.
+- **Manifest is a new on-disk contract.** Once written, `execution.json` must be versioned and migrated
+  carefully; a schema change is a data-format change.
+- **Resource hints can be wrong.** A SLURM job whose declared memory is too low is OOM-killed.
+  Mitigated by a default that preserves current behaviour (4 GB / 1 CPU / 6 h),
+  by `ProcessPoolTransport` honouring only `wall_clock`,
+  and by the manifest making the first failed run diagnosable.
 
 # Rationale and alternatives
+[rationale-and-alternatives]: #rationale-and-alternatives
 
-Three designs were considered.
-The chosen interface is a deliberate hybrid.
+The central choice is **where the source of truth lives**.
+This design puts it on disk (the manifest), with the transport reduced to a liveness oracle.
+The main alternatives:
 
-```mermaid
-quadrantChart
-    title Design trade-off space
-    x-axis "Surface area (concepts)" --> "Larger"
-    y-axis "Defaults baked in" --> "More"
-    quadrant-1 "Heavy & opinionated"
-    quadrant-2 "Lean & opinionated"
-    quadrant-3 "Lean & open"
-    quadrant-4 "Heavy & open"
-    "A - Minimal": [0.18, 0.55]
-    "B - Maximally flexible": [0.92, 0.18]
-    "C - Common-case optimised": [0.38, 0.92]
-    "Hybrid (chosen)": [0.42, 0.7]
-```
+- **Transport returns results (`poll() -> Iterator[Outcome]`).**
+  The earlier draft of this RFC.
+  It forces every transport to materialise a full result object, which is natural for a process pool
+  and a Celery result backend but *false* for SLURM, where the job writes to disk and exits with a code.
+  It also keeps the lifecycle tail running in two places (worker-side for Celery callbacks,
+  coordinator-side for the pool). Routing all completion through an on-disk manifest removes both problems.
 
-| Dimension             | A — Minimal | B — Maximal | C — Common-case | **Hybrid** |
-| --------------------- | :---------: | :---------: | :-------------: | :--------: |
-| Public surface        |      1      |      5      |        2        |     2      |
-| Defaults baked in     |      3      |      1      |        5        |     4      |
-| Bend without editing  |      3      |      5      |        2        |     3      |
-| Migration churn       |      4      |      5      |        2        |     3      |
-| Resource-hint support |      0      |      5      |        0        |     5      |
-| Speculation tax       |      0      |      3      |        0        |     1      |
+- **Keep per-executor lifecycles, share helpers only.**
+  This is roughly today's state: `result_handling.py` already shares promotion and ingest.
+  But nothing forces a new backend through the shared path, and crash-robustness is impossible
+  without a durable on-disk record. A new SLURM executor would re-derive retry and dirty handling inline.
 
-- **A — Minimal**: 2 methods, 1 port, everything else hidden.
-  No place for resource hints or per-provider retry without later kwarg growth.
-- **B — Maximal**: 5 ports (Transport, ArtifactStore, RetryPolicy,
-  IngestSink, FragmentAllocator) + 7 hooks + entry-point plugin registry.
-  Earned the wire-type split and `ResourceHint`; everything else is
-  speculation.
-- **C — Common-case**: one class, defaults sourced from `Config`,
-  solver call site collapses to one line.
-  A `ResultSink` callback that Celery silently ignores is an asymmetry
-  that will trip someone, and there is still no place for resource hints.
+- **Database-only completion (no manifest).**
+  Record outcome only in the database, as today.
+  This cannot survive a coordinator crash mid-run, cannot make a result directory self-describing,
+  and cannot support regression comparison or replay — the primary drivers.
 
-**Chosen hybrid**: C's façade (one class, hot/cold method split) +
-A's transport contract (`dispatch(envelope)` + `poll() -> Iterator[Outcome]`,
-no result callback) + A's `BundleWriter` separation +
-B's `ExecutionEnvelope`/`Telemetry` wire types.
-Dropping the result callback is what costs Celery its fire-and-forget
-ingestion (see Drawbacks); it is chosen for one uniform pull path, and a
-worker-side `IngestSink` remains a non-breaking future addition.
-Deferred: `ArtifactStore`, `IngestSink`, `LifecycleHooks`,
-`FragmentAllocator` as a port, plugin registry.
-The shallow `Executor` Protocol and the three concrete executors
-are deleted (with a deprecation cycle for `import_executor_cls`; see
-Drawbacks).
-
-**Impact of not doing this**: each new transport reimplements its own
-dispatch / poll / timeout wiring and re-derives retry and dirty handling
-inline (the shared promotion/ingest helpers in `result_handling.py` already
-exist, but nothing forces a new transport to route through them);
-resource hints retrofit later through a new wire format (strictly larger
-change); per-task timeout, CV validation, dirty-flag, and exception
-classification stay scattered.
+**Impact of not doing this.**
+Each new backend re-implements lifecycle wiring and re-derives retry/dirty inline;
+results stay anonymous on disk, so regression comparison and replay stay impossible;
+crashes remain undiagnosable from durable state.
 
 # Prior art
+[prior-art]: #prior-art
 
-- **Dask `distributed`** — `resources=` annotations on submitted tasks
-  inspire `ResourceHint`.
-- **Snakemake / Nextflow** — first-class `resources:` directives
-  translate transparently into SLURM / PBS / K8s. Same mental model at
-  the diagnostic level.
-- **Airflow** — executor / operator split; `BaseExecutor.execute_async`
-  - `sync` is essentially `Transport.dispatch` + `Transport.poll`.
-- **Celery** — `task_time_limit` + queue routing. `ResourceHint.queue`
-  maps onto Celery queues; `wall_clock` onto `task_time_limit` /
-  `task_soft_time_limit`. Today's `CeleryExecutor` uses neither.
-- **Rust RFC process** — document shape inherited via this repo's
-  template.
+- **CMEC / EMDS.** The output and diagnostic bundles, provenance, and dimensions are CMEC concepts;
+  the manifest extends CMEC provenance rather than inventing a parallel vocabulary.
+- **Snakemake / Nextflow.** First-class `resources:` directives that translate into SLURM / PBS / cloud.
+  Same mental model at the diagnostic level (`ResourceHint`).
+  Both also treat the working directory as the durable record of a job — the manifest follows this.
+- **Dask `distributed`.** `resources=` annotations on submitted tasks inspire `ResourceHint`.
+- **Airflow.** Executor / scheduler split; `BaseExecutor` exposes async submit plus a sync/heartbeat that
+  reconciles task state from the database — essentially `dispatch` plus `status`-driven `drain`.
+- **Celery.** `task_time_limit` and queue routing; `ResourceHint.queue` maps onto Celery queues and
+  `wall_clock` onto `task_time_limit`. Today's `CeleryExecutor` uses neither.
+- **Make / build systems.** A target is rebuilt unless its output exists and is current — the same logic as
+  reading a manifest outcome from disk before deciding to re-run.
 
 # Unresolved questions
+[unresolved-questions]: #unresolved-questions
 
-To resolve through this RFC:
+To resolve through the RFC process:
 
-- Should `ResourceHint` include `gpu: int` / `io_intensive: bool`?
-  Recommended default: add when a concrete adapter needs them.
-- Where does the CV come from in tests? `PermissiveCV()` fixture
-  vs. project CV baked into a constant.
-- Is `replay_abandoned` automatic on `__init__` or explicit from the CLI?
-  Draft assumes explicit.
-- Is detached (coordinator-free) submission a hard requirement for Celery
-  deployments? If yes, a worker-side `IngestSink` ships with the cutover
-  rather than as a deferred addition.
+- The exact `ExecutionManifest` field set and `schema_version` stability guarantees.
+- Whether the Celery eager-ingest hook (`link`) is retained or Celery polls purely via `status`.
+- Where the controlled vocabulary comes from in tests (a permissive fixture vs. the project CV).
 
 To resolve through implementation:
 
-- Exact upsert unique constraints + Alembic migration.
-- Deprecation path for `import_executor_cls` / the executor FQN config key
-  (name → transport mapping, warning on custom executors, migration note).
-- `CeleryTransport.poll` semantics (per-task `AsyncResult.get` vs batch
-  inspection).
-- `peak_rss_mb` capture across macOS / Linux (`getrusage` unit difference).
+- Exact upsert unique constraints and any Alembic migration
+  (`output_fragment`, `provider_version`, and `diagnostic_version` already exist).
+- `sacct` / `squeue` / `qstat` polling cadence and output parsing for the HPC transports.
+- The deprecation mechanics for `import_executor_cls` and the executor dotted-path config key.
 
-Out of scope:
+Out of scope for this RFC (addressed independently later):
 
-- Adaptive resource provider (telemetry columns land here; the
-  provider is a follow-up RFC).
-- GPU scheduling, multi-tenant queues.
-- Replacing SLURM / PBS / Celery as schedulers.
+- **K8s transport.**
+- **External / "null" execution** — a directory produced entirely outside the REF, then ingested.
+  The format already supports it; the operational contract does not yet.
+- **Cross-deployment portability beyond shared datasets.**
+  Tier 2 (the importing deployment already indexes the same ESGF datasets, resolved by `instance_id`)
+  is enabled by the manifest's `datasets` field.
+  Tier 3 (datasets *not* present locally) needs dataset support for remote / not-yet-local files
+  and is a separate RFC. The manifest carries the cross-link information (`instance_id`) but not the files.
+- **External-execution version policy.** The default is ingest-as-is:
+  a result lands under its declared `diagnostic_version`, surfaces only if it equals the local
+  `promoted_version`, is CV-validated, and is never rejected on version. Hardening is deferred.
+- **Adaptive resource provider and per-execution telemetry columns.**
+- **Making CV validation a hard failure.**
 
 # Future possibilities
+[future-possibilities]: #future-possibilities
 
-Each item below is a self-contained follow-up enabled by this RFC:
+- **K8s transport** — a pod per execution with `resources` and an active deadline; `status` from the pod phase.
+- **External / null transport** — the lowest-friction modelling-centre adoption path:
+  a centre runs the diagnostic in its own pipeline, writes `execution.json` + bundles to the expected layout,
+  and `ref ingest <dir>` loads it. The manifest becomes a public, versioned contract.
+- **Remote-file datasets (portability tier 3)** — resolve `instance_id` references whose files are not local,
+  populated from ESGF queries or from imported result bundles, so a fresh database can be bootstrapped.
+- **Adaptive `ResourceProvider`** — capture per-execution telemetry (peak RSS, duration) into the manifest
+  and the database, then suggest `ResourceHint` memory at, say, p95 × 1.2 over a rolling window.
+- **Cross-restart recovery** — already largely free: because `drain` reconstructs the in-flight set from the
+  database and `status` queries durable scheduler state, a coordinator that was down while a SLURM job finished
+  picks it up on the next `drain`.
+- **Per-provider retry policies** — the single worker-side classifier becomes a per-provider mapping
+  when concrete demand appears.
 
-- **SLURM / PBS transports** — thin adapters: `dispatch` builds a job
-  script from `envelope.resources` and submits it, `poll` queries
-  `squeue` / `qstat` and computes the deadline from job start time.
-- **Adaptive `ResourceProvider`** — reads `Execution.peak_rss_mb` over
-  a rolling window, suggests memory hint at p95 × 1.2.
-- **Per-provider retry policies** — single `RetryPolicy` becomes
-  `Mapping[str, RetryPolicy]` keyed on provider slug when concrete
-  demand arrives.
-- **Streaming partial outcomes** — `Transport.poll` already incremental;
-  add a `PartialOutcome` event when a UI consumer appears.
-- **S3 / HTTP artifact store** — extract `_Promoter` into an
-  `ArtifactStore` port when a non-local target lands.
-- **Pluggable ingest sinks** — Prometheus, audit log, S3 mirror as
-  ordered `IngestSink` observers when a second sink materialises.
-- **Cross-restart recovery** — extend `replay_abandoned` with
-  `Transport.lookup(transport_meta)` so a SLURM job finished while the
-  coordinator was down is picked up.
-
-None of these are reasons to accept this RFC on their own;
-they show the seam is the right shape for the directions the project is
-plausibly heading, without pre-baking any of them.
+None of these justify the RFC on their own;
+they show the manifest-plus-liveness seam is shaped for where the project is heading
+without pre-building any of them.
