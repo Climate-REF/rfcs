@@ -12,7 +12,8 @@ Add a declarative `ResourceHint` on every `Diagnostic`
 and capture per-execution `Telemetry`,
 so providers can express memory / CPU / wall-clock once
 and future schedulers (SLURM, PBS, K8s)
-plug in as ~100 LOC adapters.
+plug in as thin adapters that only translate the envelope
+and poll job state.
 
 # Motivation
 [motivation]: #motivation
@@ -23,10 +24,11 @@ A single happy-path run touches
 `solver.py` (allocates row + fragment, register_datasets, expunge, commit),
 `climate_ref_core/executor.py` (`execute_locally`, `_is_system_error`,
 `CondaCommandError` handling),
-`climate_ref_core/diagnostics.py` (`ExecutionResult.build_from_output_bundle`
-which secretly writes three JSON files inside a frozen-attrs factory),
+`climate_ref_core/diagnostics.py` (`ExecutionResult.build_from_output_bundle`,
+a static factory that writes three JSON files to disk as a side effect of
+constructing the result),
 `climate_ref/executor/result_handling.py` (scratch→results copy ×4,
-ingestion in nested-tx, dirty-flag toggled in 3 branches),
+ingestion in nested-tx, dirty-flag toggled in 3 branches of the result path),
 `climate_ref/executor/fragment.py` (PLACEHOLDER_FRAGMENT, group_short),
 and one of `synchronous.py` / `local.py` / `climate_ref_celery/executor.py`
 (each reimplementing the same reattach / commit / mark dance).
@@ -35,23 +37,34 @@ Concrete consequences today:
 
 - **Providers have no place to declare parallelisation hints.**
   ESMValTool diagnostics that need 16 GB or 8 h have nowhere to say so;
-  `LocalExecutor` hardcodes a 6 h per-task timeout,
+  `LocalExecutor` applies one 6 h per-task timeout to every diagnostic
+  (a single constructor default, not per-diagnostic),
   `CeleryExecutor` enforces no per-task timeout at all,
   and a future SLURM/PBS adapter has nothing to translate into `sbatch`/`qsub`.
 - **Retry classification is scattered** across `_is_system_error`,
   the `CondaCommandError` branch, missing-log handling, `LocalExecutor`'s
   per-task timeout, and pool-shutdown abandonment.
-- **The `dirty` flag is decided in three places**
+- **The `dirty` flag is decided in three branches of the result path**
   (success path, non-retryable failure, retryable failure / missing log).
+  User-initiated `dirty=True` resets in `cli/executions.py` (rerun / reset)
+  are deliberately separate and stay outside the consolidated rule.
 - **CV validation is silenced** (`logger.warning` with TODO instead of raising).
 - **Tests mock subprocess + filesystem + DB + Celery** and import private
   helpers (`_is_system_error`) to compensate for the missing seam.
-- **`ExecutionResult` is not cleanly picklable** because its frozen factory
-  performs disk I/O.
+- **`ExecutionResult` construction is entangled with disk I/O.**
+  It already pickles across the `ProcessPoolExecutor` boundary today
+  (`_process_run` returns it to the parent), so picklability is not the
+  problem — the problem is that the factory cannot be exercised without a
+  writable output directory, which forces filesystem fixtures into every
+  unit test that builds a result.
 
-The CMIP REF is approaching deployment targets (SLURM / PBS / K8s) where
-each new adapter would otherwise mean ~250 LOC of duplicated lifecycle
-wiring.
+The CMIP REF is approaching deployment targets (SLURM / PBS / K8s).
+The recurring lifecycle logic — fragment allocation, the reattach / commit /
+mark dance, scratch→results promotion, retry classification — is already
+shared in `result_handling.py`; what each new transport reimplements is the
+dispatch / poll / timeout wiring around it.
+This RFC pulls that shared logic behind one seam so a transport contributes
+only its dispatch and poll, not a copy of the lifecycle.
 This RFC is **not** about replacing SLURM, PBS, K8s, or Celery as schedulers.
 It is about defining a single robust seam *above* them.
 
@@ -69,7 +82,6 @@ classDiagram
         +submit(execution, definition)
         +drain(timeout) None
         +replay_abandoned() list~int~
-        +dry_run(group, datasets) ExecutionDefinition
         -_FragmentAllocator
         -_Classifier
         -_Promoter
@@ -106,12 +118,23 @@ classDiagram
 
 Picklable value objects only. No DB sessions, `Config`, or CV cross the boundary.
 
+`ResourceHint` lives in `climate_ref_core` (the `Diagnostic` base class
+declares it, and core cannot import the application package).
+`ExecutionEnvelope`, `Telemetry`, `ExecutionOutcome`, and the `Transport`
+protocol live in `climate_ref.lifecycle` alongside `ExecutionLifecycle`.
+
+The default `wall_clock` is **6 h**, matching today's `LocalExecutor`
+per-task timeout, so diagnostics that run for hours without declaring
+`resources` keep their current budget (Celery enforces no limit today, so
+nothing regresses there either). Tightening the default is a separate,
+explicit decision.
+
 ```python
 @attrs.frozen
 class ResourceHint:
     memory_mb: int = 4096
     cpu: int = 1
-    wall_clock: timedelta = timedelta(hours=2)
+    wall_clock: timedelta = timedelta(hours=6)   # matches current LocalExecutor budget
     queue: str | None = None    # transport-specific routing tag
 
 @attrs.frozen
@@ -119,7 +142,10 @@ class ExecutionEnvelope:
     execution_id: int
     definition: ExecutionDefinition
     resources: ResourceHint
-    deadline: datetime          # clock() + resources.wall_clock at submit time
+    # wall_clock travels in `resources`; the *deadline* is computed by the
+    # transport when the job starts running, not here — a queued SLURM/PBS
+    # job may wait hours before it begins, so anchoring the deadline at
+    # submit time would expire jobs before they start.
 
 @attrs.frozen
 class Telemetry:
@@ -202,10 +228,10 @@ sequenceDiagram
     L->>D: resources_for(definition)
     D-->>L: ResourceHint(...)
     L->>DB: allocate fragment + register_datasets + expunge + commit
-    Note over L: deadline = clock() + resources.wall_clock
     L->>T: dispatch(ExecutionEnvelope)
 
     Note over T,W: sbatch · qsub · pool.submit · celery send · inline
+    Note over T: deadline = job_start + resources.wall_clock (transport-side)
     T->>W: hand off envelope
     activate W
     W->>W: diagnostic.run · _BundleWriter.write · CV.validate · Telemetry
@@ -224,6 +250,28 @@ sequenceDiagram
 
 ## Retry + dirty rule (one source of truth)
 
+Classification happens in two clearly separated places.
+
+**Worker side** — exception → outcome. The worker runs the diagnostic and
+maps the raised exception (or clean return) onto the booleans carried by
+`ExecutionResult` / `ExecutionFailure`. This is where the exception-type
+knowledge lives, because the exception is only ever raised on the worker:
+
+```python
+# worker-side, inside the run path
+SYSTEM_ERRORS = (OSError, MemoryError, SystemExit, KeyboardInterrupt)  # → retryable
+NON_RETRYABLE = (CondaCommandError,)                                   # → give up
+```
+
+This consolidates the exception-classification logic that is **today**
+spread across `_is_system_error` and the separate `CondaCommandError`
+branch in `execute_locally` into one worker-side function.
+
+**Coordinator side** — outcome → decision. The policy never inspects
+exception types; it maps the already-classified outcome onto a decision,
+so the same rule applies identically to every transport (including remote
+ones where the exception object never comes back):
+
 ```python
 class RetryDecision(enum.Enum):
     SUCCESS = "success"
@@ -231,9 +279,6 @@ class RetryDecision(enum.Enum):
     GIVE_UP = "give_up"   # sets dirty=False, marks failed
 
 class DefaultRetryPolicy:
-    SYSTEM_ERRORS = (OSError, MemoryError, SystemExit, KeyboardInterrupt)
-    NON_RETRYABLE = (CondaCommandError,)
-
     def classify(self, outcome: ExecutionOutcome) -> RetryDecision:
         if outcome.failure is not None:  # timeout | broker_lost | pool_shutdown
             return RetryDecision.RETRY
@@ -243,9 +288,10 @@ class DefaultRetryPolicy:
         return RetryDecision.RETRY if r.retryable else RetryDecision.GIVE_UP
 ```
 
-Replaces `_is_system_error`, the `CondaCommandError` branch,
-missing-log handling, the per-task timeout path,
-and pool-shutdown abandonment — five sites collapse to one.
+Net effect: exception classification goes from two scattered sites to one
+worker-side function, and the *transport-level* outcomes that today live in
+the per-executor `join` loops (missing log, per-task timeout, pool-shutdown
+abandonment) collapse into the single coordinator policy above.
 
 ## Idempotent ingest, telemetry
 
@@ -254,6 +300,13 @@ Ingestion uses `INSERT … ON CONFLICT DO NOTHING` on natural keys
 `(execution_id, dimensions_hash[, index_name])` for metric/series values),
 so `replay_abandoned()` is safe.
 Scratch-to-results copy uses `exist_ok=True`.
+
+`DO NOTHING` (rather than `DO UPDATE`) is correct because every key is
+scoped to `execution_id`, and each solve mints a **new** `Execution` row per
+attempt: a retry produces a fresh `execution_id`, so its values never
+collide with the abandoned attempt's. The conflict clause therefore only
+guards re-ingestion of the *same* `execution_id` during replay — it never
+silently keeps stale values from a previous attempt.
 
 New `Execution` columns: `duration_seconds`, `peak_rss_mb`, `telemetry_meta JSON`.
 No solver code reads these today; they exist so a future adaptive
@@ -279,22 +332,47 @@ CV mismatch raises `ResultValidationError`;
 # Drawbacks
 [drawbacks]: #drawbacks
 
-- **Migration is wide.** The lifecycle lands in one piece because every
-  transport depends on it. Transports can ship staggered after that.
+- **Celery loses fire-and-forget ingestion — the biggest trade-off.**
+  Today `CeleryExecutor` attaches `link` / `link_error` callbacks
+  (`handle_result` / `handle_failure`) so a worker ingests its own result
+  with no live coordinator; the submitting process can exit immediately.
+  The pull model (`Transport.poll` feeding `drain`) couples ingestion to a
+  coordinator that stays alive for the whole batch. This is a real
+  regression for the distributed case and is accepted deliberately: it buys
+  one ingestion path and uniform retry/dirty handling across transports,
+  and `replay_abandoned` (backed by `CeleryTransport` persisting task IDs
+  alongside execution IDs) recovers a coordinator crash mid-drain. If
+  detached submission turns out to be a hard requirement, a worker-side
+  `IngestSink` callback can be added later without changing the seam — but
+  the draft does **not** preserve it, and reviewers should weigh that.
+- **Migration is wide and the seam swap is atomic.** Staggering applies to
+  *adding* transports later, not to the cutover: `climate-ref-core` (wire
+  types, `ResourceHint` on `Diagnostic`), `climate-ref`
+  (`ExecutionLifecycle`, the transports), `climate-ref-celery`, and an
+  Alembic migration all land together, because the seam replaces the
+  `Executor` protocol the solver calls. Proposed landing order to bound
+  risk: (1) add `ResourceHint` + telemetry columns (additive, no behaviour
+  change); (2) introduce `ExecutionLifecycle` + `InMemoryTransport` +
+  `ProcessPoolTransport` behind the existing solver entry point with the old
+  executors still present; (3) port Celery; (4) delete the old executors.
+- **Deleting the `Executor` protocol is a breaking public change.**
+  `import_executor_cls` resolves an executor from a dotted path in `Config`,
+  so the executor class is a documented extension point and any downstream
+  custom executor implements it. The cutover must ship a deprecation cycle:
+  keep `import_executor_cls` resolving known names to the new transports,
+  warn on custom FQNs, and provide a config-migration note. This is not yet
+  spelled out and is a precondition for merge.
 - **CV becomes hard-fail.** Today's silent `logger.warning` becomes a
   raise. Intentional, but needs a one-cycle deprecation window where
-  the violation is `ERROR` but not raised.
+  the violation is `ERROR` but not raised — and it ships in the same wide
+  migration as the seam swap, so it must be feature-flagged to keep the two
+  behaviour changes independently bisectable.
 - **One fat class (~400–500 LOC).** Intentional depth, but reviewers
-  should expect a large file.
-- **Celery has no broker-side result handler anymore.**
-  `CeleryTransport.poll` feeds outcomes back into `drain`.
-  A coordinator crash mid-drain is recovered by `replay_abandoned`,
-  which requires `CeleryTransport` to persist task IDs alongside
-  execution IDs.
+  should expect a large file. (LOC is an estimate, not a target.)
 - **Resource hints can be wrong.** SLURM will OOM-kill a job whose
-  declared memory is too low. Mitigated by a generous default
-  (4 GB / 1 CPU / 2 h), by `ProcessPoolTransport` ignoring everything
-  except `wall_clock`, and by telemetry capture making the first
+  declared memory is too low. Mitigated by a default that preserves current
+  behaviour (4 GB / 1 CPU / 6 h), by `ProcessPoolTransport` ignoring
+  everything except `wall_clock`, and by telemetry capture making the first
   failed run actionable.
 
 # Rationale and alternatives
@@ -342,15 +420,22 @@ quadrantChart
 A's transport contract (`dispatch(envelope)` + `poll() -> Iterator[Outcome]`,
 no result callback) + A's `BundleWriter` separation +
 B's `ExecutionEnvelope`/`Telemetry` wire types.
+Dropping the result callback is what costs Celery its fire-and-forget
+ingestion (see Drawbacks); it is chosen for one uniform pull path, and a
+worker-side `IngestSink` remains a non-breaking future addition.
 Deferred: `ArtifactStore`, `IngestSink`, `LifecycleHooks`,
 `FragmentAllocator` as a port, plugin registry.
 The shallow `Executor` Protocol and the three concrete executors
-are deleted.
+are deleted (with a deprecation cycle for `import_executor_cls`; see
+Drawbacks).
 
-**Impact of not doing this**: each new transport reimplements ~250 LOC
-of lifecycle wiring; resource hints retrofit later through a new wire
-format (strictly larger change); per-task timeout, CV validation,
-dirty-flag, and retry classification stay scattered.
+**Impact of not doing this**: each new transport reimplements its own
+dispatch / poll / timeout wiring and re-derives retry and dirty handling
+inline (the shared promotion/ingest helpers in `result_handling.py` already
+exist, but nothing forces a new transport to route through them);
+resource hints retrofit later through a new wire format (strictly larger
+change); per-task timeout, CV validation, dirty-flag, and exception
+classification stay scattered.
 
 # Prior art
 [prior-art]: #prior-art
@@ -379,10 +464,15 @@ To resolve through this RFC:
   vs. project CV baked into a constant.
 - Is `replay_abandoned` automatic on `__init__` or explicit from the CLI?
   Draft assumes explicit.
+- Is detached (coordinator-free) submission a hard requirement for Celery
+  deployments? If yes, a worker-side `IngestSink` ships with the cutover
+  rather than as a deferred addition.
 
 To resolve through implementation:
 
 - Exact upsert unique constraints + Alembic migration.
+- Deprecation path for `import_executor_cls` / the executor FQN config key
+  (name → transport mapping, warning on custom executors, migration note).
 - `CeleryTransport.poll` semantics (per-task `AsyncResult.get` vs batch
   inspection).
 - `peak_rss_mb` capture across macOS / Linux (`getrusage` unit difference).
@@ -399,8 +489,9 @@ Out of scope:
 
 Each item below is a self-contained follow-up enabled by this RFC:
 
-- **SLURM / PBS transports** — ~100 LOC adapters; `dispatch` builds a
-  job script from `envelope.resources`, `poll` queries `squeue` / `qstat`.
+- **SLURM / PBS transports** — thin adapters: `dispatch` builds a job
+  script from `envelope.resources` and submits it, `poll` queries
+  `squeue` / `qstat` and computes the deadline from job start time.
 - **Adaptive `ResourceProvider`** — reads `Execution.peak_rss_mb` over
   a rolling window, suggests memory hint at p95 × 1.2.
 - **Per-provider retry policies** — single `RetryPolicy` becomes
