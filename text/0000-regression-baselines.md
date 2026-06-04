@@ -1,20 +1,22 @@
 - Feature Name: `regression_baselines`
 - Start Date: 2026-06-04
-- RFC PR: [CMIP-REF/rfcs#0000](https://github.com/CMIP-REF/rfcs/pull/0000)
+- RFC PR: [CMIP-REF/rfcs#5](https://github.com/CMIP-REF/rfcs/pull/0005)
 
 # Summary
 
-Manage diagnostic regression baselines as **two layers**:
+Manage diagnostic regression **baselines**.
+Each baseline (one test-case run) has **two bundles**:
 
-1. A small, human-readable **golden** (the REF-shaped `series.json` + CMEC bundles)
+1. A small, human-readable **committed bundle** (the REF-shaped `series.json` + CMEC bundles)
    committed directly to the source repo —
    this is the test *gate* and the in-PR *diff signal*.
-2. The large, binary **native diagnostic outputs** stored outside git in an object store
-   and referenced from a single git-committed **`native_manifest.json`**
-   (sha256 digests of the golden, the native files, and the extraction inputs).
+2. A large, binary **native bundle** (the diagnostic's native outputs)
+   stored outside git in an object store
+   and referenced from a single git-committed **`manifest.json`**
+   (sha256 digests of the committed bundle, the native files, and the extraction inputs).
 
 The REF CLI (`ref test-cases`) fetches, runs, and mints baselines.
-The native outputs double as the **input fixtures that test the native→bundle extraction step**,
+The native bundle doubles as the **input fixtures that test the native->bundle extraction step**,
 so most PRs are verified fast on a stock runner without re-running the (expensive) diagnostic.
 
 The **object-store backend is left as an explicit open decision** (see Unresolved questions) —
@@ -45,17 +47,16 @@ Diagnostic regression testing today is flaky, opaque, and bloats the repo:
   The integration runner shares a writable cache;
   untrusted fork code must never reach it or any write credential.
 
-A key reframe: **the native outputs are not review-only artifacts —
-they are the input fixtures for the extraction step.**
+A key reframe: **the native bundle is not a review-only artifact —
+it is the input fixtures for the extraction step.**
 `Diagnostic.run()` is `execute()` (runs the diagnostic, writes native)
-then `build_execution_result()` (reads native → CMEC bundle + series).
-`RegressionValidator` already replays *committed native* through `build_execution_result`
-without re-running the diagnostic.
+then `build_execution_result()` (reads native -> CMEC bundle + series).
+`RegressionValidator` already replays *committed native* through `build_execution_result` without re-running the diagnostic.
 That makes a fast, fork-safe extraction test possible on a stock runner — *if* the native is fetchable.
 
 # Reference-level explanation
 
-## Two layers, one manifest
+## Two bundles, one manifest
 
 For each `(provider, diagnostic, test-case)`:
 
@@ -64,25 +65,25 @@ packages/<provider>/tests/test-data/<diagnostic>/<test-case>/
   catalog.yaml            # committed: dataset metadata (exists today, content-hashed)
   catalog.paths.yaml      # gitignored: per-user local paths (exists today)
   regression/
-    series.json           # committed GOLDEN (the gate + diff signal)
-    diagnostic.json        # committed GOLDEN (CMEC metric bundle)
-    output.json           # committed GOLDEN (CMEC output bundle)
-  native_manifest.json    # committed: source of truth binding golden <-> native
+    series.json           # committed bundle (the gate + diff signal)
+    diagnostic.json        # committed bundle (CMEC metric bundle)
+    output.json           # committed bundle (CMEC output bundle)
+  manifest.json    # committed: source of truth binding committed bundle <-> native bundle
 ```
 
 The native bytes (provenance + matched `*.nc` / `*.png`) live in the object store, **not** in git.
 
-`native_manifest.json`:
+`manifest.json`:
 
 ```json
 { "schema": 1,
-  "golden":  { "series.json": "<sha256>", "diagnostic.json": "<sha256>", "output.json": "<sha256>" },
+  "committed":  { "series.json": "<sha256>", "diagnostic.json": "<sha256>", "output.json": "<sha256>" },
   "native":  { "<relpath>": { "sha256": "...", "size": ... } },
   "extraction_inputs": { "files_series_digest": "<sha256>", "input_selectors_digest": "<sha256>" } }
 ```
 
-- `golden` binds the committed golden bytes to the manifest:
-  CI recomputes the golden digests and asserts they equal `manifest.golden`.
+- `committed` binds the committed bundle bytes to the manifest:
+  CI recomputes the committed digests and asserts they equal `manifest.committed`.
   A commit that updates `series.json` but not the manifest (or vice-versa) **fails loudly** —
   closing the one consistency leg content-addressing does not cover.
 - `native` lists the curated native blobs by content digest (immutable, dedups, survives history).
@@ -92,7 +93,7 @@ The native bytes (provenance + matched `*.nc` / `*.png`) live in the object stor
 
 Two manifest sections keep the diff readable:
 a changed `native` block means native changed;
-a changed `golden` block means extraction output changed.
+a changed `committed` block means extraction output changed.
 
 ## Curated capture (kills the bloat at the source)
 
@@ -127,40 +128,40 @@ Backend selection is deferred to a maintainer decision (Unresolved questions).
 
 ## CLI (extends the existing `ref test-cases` app)
 
-| Subcommand | Purpose | Creds |
-|------------|---------|-------|
-| `run --provider P --diagnostic D` | run `execute()` + `build_execution_result`, write golden + manifest locally | none (local) |
-| `sync [--provider P]` | fetch native blobs named by the committed manifest(s) | none (public read) |
-| `replay --provider P --diagnostic D` | fetch native, run `build_execution_result`, compare to golden | none (public read) |
-| `mint --provider P` | `run` + `put` native to the store + update manifest | write creds |
+| Subcommand                           | Purpose                                                                              | Creds              |
+| ------------------------------------ | ----------------------------------------------------------------------------------- | ------------------ |
+| `run --provider P --diagnostic D`    | run `execute()` + `build_execution_result`, write committed bundle + manifest locally | none (local)       |
+| `sync [--provider P]`                | fetch native blobs named by the committed manifest(s)                                | none (public read) |
+| `replay --provider P --diagnostic D` | fetch native, run `build_execution_result`, compare to committed bundle               | none (public read) |
+| `mint --provider P`                  | `run` + `put` native to the store + update manifest                                  | write creds        |
 
 `mint` is the only credentialed verb and runs only on trusted contexts.
 
 ## Tiered CI
 
 - **PR — any, incl forks — stock `ubuntu-latest`, no secrets.**
-  `ref test-cases sync` (public read) → `replay` → diff golden → post a PR comment.
+  `ref test-cases sync` (public read) -> `replay` -> diff committed bundle -> post a PR comment.
   Figures surfaced but **non-blocking**.
   Routed by changed-files so the check is *honest*:
-  - PR touches extraction (`build_execution_result`, `files`/`series`) or golden/manifest → run the replay;
+  - PR touches extraction (`build_execution_result`, `files`/`series`) or committed/manifest -> run the replay;
     the check is named **`extraction-replay`** and its green means what it says.
-  - PR touches `execute()` only → replay is a tautology →
+  - PR touches `execute()` only -> replay is a tautology ->
     emit a **neutral "execute-changed: needs runner verification"** check (not green),
     linking the bootstrap path.
   - A fetch *miss* for a fixture the manifest says should exist is a **failure, not a skip**
-    (today, missing fixtures silently skip → false green).
-- **Same-repo PR — self-hosted runner, no upload — when a golden file changes.**
+    (today, missing fixtures silently skip -> false green).
+- **Same-repo PR — self-hosted runner, no upload — when a committed bundle file changes.**
   Run the slow `execute()` to confirm the diagnostic still reproduces its native,
   catching breakage pre-merge.
   Gated with no labels: `if: github.event.pull_request.head.repo.full_name == github.repository`.
 - **Merge to `main` — self-hosted runner, the only job holding write creds.**
-  `ref test-cases mint` → `execute()` + `put` native + update manifest.
+  `ref test-cases mint` -> `execute()` + `put` native + update manifest.
 - **Nightly — self-hosted runner.**
   Full sweep; drift detection backstop;
   opens an auto-PR with the new manifest + a human-readable summary if outputs drift.
 - **Fork PR needing new/changed native** (a new diagnostic, or an `execute()` change):
   a documented `workflow_dispatch` a maintainer triggers
-  to mint on the trusted runner and push the golden + manifest back to the PR.
+  to mint on the trusted runner and push the committed bundle + manifest back to the PR.
   Forks never run `execute()` on the self-hosted runner (untrusted code, shared cache).
 
 ## Self-hosted runner security
@@ -182,11 +183,11 @@ requires removing nondeterminism first:
 
 - **Execution-dir timestamp.**
   ESMValTool writes a `recipe_<YYYYMMDD>_<HHMMSS>` dir that gets baked into `output.json`.
-  Sanitise `recipe_\d{8}_\d{6}` → a placeholder in both capture and comparison.
+  Sanitise `recipe_\d{8}_\d{6}` -> a placeholder in both capture and comparison.
   Tracked as [Climate-REF/climate-ref#713](https://github.com/Climate-REF/climate-ref/issues/713).
 - **Floats.**
-  Replay path (stored native → extraction) is deterministic → exact compare.
-  Execute path (re-run) has float jitter → compare structure/dimensions only,
+  Replay path (stored native -> extraction) is deterministic -> exact compare.
+  Execute path (re-run) has float jitter -> compare structure/dimensions only,
   leaving numeric values to the replay path;
   any value that must be compared on the execute path uses a relative tolerance, never exact equality.
 
@@ -197,7 +198,7 @@ requires removing nondeterminism first:
 - Native is a cache of a regenerable artifact:
   losing a digest still referenced by a reachable manifest breaks historical replay
   (mitigated by reachability-aware retention).
-- Golden minting is effectively a maintainer/CI action for conda providers
+- Committed-bundle minting is effectively a maintainer/CI action for conda providers
   (esmvaltool's env is ~1373 packages);
   external authors usually cannot run `execute()` locally.
 - Fork `execute()` changes have no automated PR signal until bootstrapped —
@@ -207,8 +208,8 @@ requires removing nondeterminism first:
 
 # Rationale and alternatives
 
-**Why two layers.**
-Keeping the small REF-shaped golden in git
+**Why two bundles.**
+Keeping the small REF-shaped committed bundle in git
 puts the review signal where reviewers already work (the PR diff)
 and keeps the gate human-readable;
 moving the large binaries out of git removes the bloat
@@ -243,7 +244,7 @@ and silent upstream regressions stay invisible until a manual check.
 
 - The REF's existing **catalog split** —
   the exact "commit small metadata, keep bytes out of git" pattern, here extended to outputs.
-- **pytest-regressions** (`--force-regen`) — the regenerate-the-golden workflow this mirrors.
+- **pytest-regressions** (`--force-regen`) — the regenerate-the-committed-bundle workflow this mirrors.
 - Content-addressed artifact stores with a small in-git lock (DVC, Snakemake) — same idea;
   this RFC keeps the client surface to just the REF CLI
   rather than adding a separate toolchain on contributors.
