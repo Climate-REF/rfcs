@@ -1,6 +1,6 @@
 - Feature Name: `cli_regression_baselines`
 - Start Date: 2026-06-04
-- RFC PR: [CMIP-REF/rfcs#0000](https://github.com/CMIP-REF/rfcs/pull/0000)
+- RFC PR: [CMIP-REF/rfcs#4](https://github.com/CMIP-REF/rfcs/pull/4)
 
 # Summary
 [summary]: #summary
