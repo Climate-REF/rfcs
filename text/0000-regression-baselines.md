@@ -3,7 +3,6 @@
 - RFC PR: [CMIP-REF/rfcs#0000](https://github.com/CMIP-REF/rfcs/pull/0000)
 
 # Summary
-[summary]: #summary
 
 Manage diagnostic regression baselines as **two layers**:
 
@@ -22,7 +21,6 @@ RFC specifies the *layering, manifest, CLI, and CI*, which are backend-agnostic 
 `NativeStore` interface.
 
 # Motivation
-[motivation]: #motivation
 
 Diagnostic regression testing today is flaky, opaque, and bloats the repo:
 
@@ -47,7 +45,6 @@ replays *committed native* through `build_execution_result` without re-running t
 makes a fast, fork-safe extraction test possible on a stock runner — *if* the native is fetchable.
 
 # Reference-level explanation
-[reference-level-explanation]: #reference-level-explanation
 
 ## Two layers, one manifest
 
@@ -173,7 +170,6 @@ nondeterminism first:
   exact equality.
 
 # Drawbacks
-[drawbacks]: #drawbacks
 
 - The REF CLI owns fetch/mint/credential plumbing — more surface to maintain and test than
   off-loading to an existing data-management tool.
@@ -187,7 +183,6 @@ nondeterminism first:
   (deliberate — the repo is already used by externals).
 
 # Rationale and alternatives
-[rationale-and-alternatives]: #rationale-and-alternatives
 
 **Why two layers.** Keeping the small REF-shaped golden in git puts the review signal where
 reviewers already work (the PR diff) and keeps the gate human-readable; moving the large binaries
@@ -213,7 +208,6 @@ in-PR "native changed" diff without binaries in git.
 changes without a visible diff, and silent upstream regressions stay invisible until a manual check.
 
 # Prior art
-[prior-art]: #prior-art
 
 - The REF's existing **catalog split** — the exact "commit small metadata, keep bytes out of git"
   pattern, here extended to outputs.
@@ -223,7 +217,6 @@ changes without a visible diff, and silent upstream regressions stay invisible u
   contributors.
 
 # Unresolved questions
-[unresolved-questions]: #unresolved-questions
 
 - **Object-store backend choice** — the main open decision, deferred deliberately. Candidate
   backends behind the `NativeStore` interface include an S3-compatible bucket or an OCI registry
@@ -237,7 +230,6 @@ changes without a visible diff, and silent upstream regressions stay invisible u
 - Exact form of the fork-PR **bootstrap `workflow_dispatch`**.
 
 # Future possibilities
-[future-possibilities]: #future-possibilities
 
 - Rich diff renderers in the PR comment (PNG diffs, NetCDF summary-stat diffs).
 - Reuse the same `NativeStore` + manifest for large reference/observational inputs too big for git.
