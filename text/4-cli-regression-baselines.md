@@ -172,8 +172,9 @@ CMEC bundle content comparison (currently only `series.json` is compared) requir
 nondeterminism first:
 
 - **Execution-dir timestamp.** ESMValTool writes a `recipe_<YYYYMMDD>_<HHMMSS>` dir that gets baked
-  into `output.json`. Sanitise `recipe_\d{8}_\d{6}` → a placeholder in both capture and comparison
-  (tracked separately as a REF issue to give ESMValTool a stable test execution dir).
+  into `output.json`. Sanitise `recipe_\d{8}_\d{6}` → a placeholder in both capture and comparison.
+  Tracked as [Climate-REF/climate-ref#713](https://github.com/Climate-REF/climate-ref/issues/713)
+  (give ESMValTool a stable test execution dir).
 - **Floats.** Replay path (stored native → extraction) is deterministic → exact compare. Execute
   path (re-run) has float jitter → compare structure/dimensions only, leaving numeric values to the
   replay path; any value that must be compared on the execute path uses a relative tolerance, never
