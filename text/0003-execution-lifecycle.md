@@ -3,7 +3,6 @@
 - RFC PR: [Climate-REF/rfcs#0003](https://github.com/Climate-REF/rfcs/pull/3)
 
 # Summary
-[summary]: #summary
 
 Consolidate the lifecycle of one diagnostic execution
 — allocation, dispatch, run, classify, publish, ingest, finalise —
@@ -16,7 +15,6 @@ plug in as thin adapters that only translate the envelope
 and poll job state.
 
 # Motivation
-[motivation]: #motivation
 
 The lifecycle of one execution is currently fragmented across ~8 files
 in 2 packages.
@@ -69,7 +67,6 @@ This RFC is **not** about replacing SLURM, PBS, K8s, or Celery as schedulers.
 It is about defining a single robust seam *above* them.
 
 # Reference-level explanation
-[reference-level-explanation]: #reference-level-explanation
 
 ## Module boundary
 
@@ -330,7 +327,6 @@ CV mismatch raises `ResultValidationError`;
 `replay_abandoned` returns stranded IDs.
 
 # Drawbacks
-[drawbacks]: #drawbacks
 
 - **Celery loses fire-and-forget ingestion — the biggest trade-off.**
   Today `CeleryExecutor` attaches `link` / `link_error` callbacks
@@ -376,7 +372,6 @@ CV mismatch raises `ResultValidationError`;
   failed run actionable.
 
 # Rationale and alternatives
-[rationale-and-alternatives]: #rationale-and-alternatives
 
 Three designs were considered.
 The chosen interface is a deliberate hybrid.
@@ -396,14 +391,14 @@ quadrantChart
     "Hybrid (chosen)": [0.42, 0.7]
 ```
 
-| Dimension              | A — Minimal | B — Maximal | C — Common-case | **Hybrid** |
-|------------------------|:-:|:-:|:-:|:-:|
-| Public surface         | 1 | 5 | 2 | 2 |
-| Defaults baked in      | 3 | 1 | 5 | 4 |
-| Bend without editing   | 3 | 5 | 2 | 3 |
-| Migration churn        | 4 | 5 | 2 | 3 |
-| Resource-hint support  | 0 | 5 | 0 | 5 |
-| Speculation tax        | 0 | 3 | 0 | 1 |
+| Dimension             | A — Minimal | B — Maximal | C — Common-case | **Hybrid** |
+| --------------------- | :---------: | :---------: | :-------------: | :--------: |
+| Public surface        |      1      |      5      |        2        |     2      |
+| Defaults baked in     |      3      |      1      |        5        |     4      |
+| Bend without editing  |      3      |      5      |        2        |     3      |
+| Migration churn       |      4      |      5      |        2        |     3      |
+| Resource-hint support |      0      |      5      |        0        |     5      |
+| Speculation tax       |      0      |      3      |        0        |     1      |
 
 - **A — Minimal**: 2 methods, 1 port, everything else hidden.
   No place for resource hints or per-provider retry without later kwarg growth.
@@ -438,7 +433,6 @@ change); per-task timeout, CV validation, dirty-flag, and exception
 classification stay scattered.
 
 # Prior art
-[prior-art]: #prior-art
 
 - **Dask `distributed`** — `resources=` annotations on submitted tasks
   inspire `ResourceHint`.
@@ -446,7 +440,7 @@ classification stay scattered.
   translate transparently into SLURM / PBS / K8s. Same mental model at
   the diagnostic level.
 - **Airflow** — executor / operator split; `BaseExecutor.execute_async`
-  + `sync` is essentially `Transport.dispatch` + `Transport.poll`.
+  - `sync` is essentially `Transport.dispatch` + `Transport.poll`.
 - **Celery** — `task_time_limit` + queue routing. `ResourceHint.queue`
   maps onto Celery queues; `wall_clock` onto `task_time_limit` /
   `task_soft_time_limit`. Today's `CeleryExecutor` uses neither.
@@ -454,7 +448,6 @@ classification stay scattered.
   template.
 
 # Unresolved questions
-[unresolved-questions]: #unresolved-questions
 
 To resolve through this RFC:
 
@@ -485,7 +478,6 @@ Out of scope:
 - Replacing SLURM / PBS / Celery as schedulers.
 
 # Future possibilities
-[future-possibilities]: #future-possibilities
 
 Each item below is a self-contained follow-up enabled by this RFC:
 
