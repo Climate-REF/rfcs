@@ -248,11 +248,11 @@ sequenceDiagram
     alt test_case_version bumped, or new test-case
         CI->>CI: run execute() + build_execution_result (no creds)
         CI->>CI: compare freshly built committed bundle (tolerant)
-        CI-->>PR: pr-execute check + bundle diff comment
+        CI-->>PR: pr-test-case-execute check + bundle diff comment
     else no bump, extraction code changed
         CI->>Store: ref test-cases sync (public read)
         CI->>CI: replay against existing baseline then compare (tolerant)
-        CI-->>PR: extraction-replay check + bundle diff comment
+        CI-->>PR: pr-test-case-replay check + bundle diff comment
     else committed bundle changed without a bump
         CI-->>PR: FAIL (bump test_case_version to re-baseline)
     end
@@ -276,26 +276,31 @@ How the PR check is chosen from the changed files, and where each path lands:
 
 ```mermaid
 flowchart TD
-    A[PR opened] --> B{test_case_version bumped?}
+    Start(["Push to PR"]) --> B{"test_case_version bumped?"}
 
-    B -->|"yes (or new test-case)"| X["pr-execute: run execute() + build_execution_result, no creds"]
-    B -->|no| V{committed bundle changed?}
-    V -->|yes| F["FAIL: bump test_case_version to re-baseline"]
-    V -->|"no (extraction code changed)"| C["sync native then replay existing baseline"]
+    B -->|"yes / new test-case"| X["pr-test-case-execute: run execute() + build_execution_result (no creds)"]
+    B -->|"no"| V{"committed bundle changed?"}
+    V -->|"yes"| F["FAIL: bump test_case_version to re-baseline"]
+    V -->|"no — extraction code changed"| C["pr-test-case-replay: sync native, replay existing baseline"]
 
-    X --> G{Diff within tolerance?}
+    X --> G{"Diff within tolerance?"}
     C --> G
-    G -->|yes| H["check green"]
-    G -->|no| I["red: bundle diff comment, author fixes"]
-    I --> A
-    F --> A
+    G -->|"yes"| M{"Reviewer approves + merges?"}
+    G -->|"no"| F
 
-    H --> M{Reviewer approves + merges?}
-    M -->|no| A
-    M -->|yes| P["merge to main queues gated mint"]
-    P --> Q{Maintainer approves mint?}
-    Q -->|yes| O["put native + author manifest.native (bot commit)"]
-    Q -->|no| P
+    F --> Revise(["Author revises, re-pushes"])
+    M -->|"no"| Revise
+    M -->|"yes"| P["merge to main queues gated mint"]
+    P --> Q{"Maintainer approves mint?"}
+    Q -->|"no (waits)"| P
+    Q -->|"yes"| Done(["Merged + manifest.native minted by CI"])
+
+    classDef entry fill:#dff5e1,stroke:#1a7f37,stroke-width:2px;
+    classDef good fill:#dbeafe,stroke:#1d4ed8,stroke-width:2px;
+    classDef warn fill:#fde7c7,stroke:#b45309,stroke-width:2px;
+    class Start entry;
+    class Done good;
+    class Revise warn;
 ```
 
 ## Comparison
@@ -364,7 +369,7 @@ The clean in-PR semantic diff comes from the committed bundle, not the native di
 - **Git LFS.**
   Pointer churn remains; GitHub LFS egress costs are very low and it requires additional steps when checking out.
 - **Regenerate-on-demand, store nothing.**
-  The cheap `extraction-replay` path skips conda + `execute()` by fetching stored native;
+  The cheap `pr-test-case-replay` path skips conda + `execute()` by fetching stored native;
   dropping the store forces every PR onto the slow execute path.
   Storing native keeps the common extraction-only PR fast.
   Per-provider the `NativeStore` interface still allows mixing
