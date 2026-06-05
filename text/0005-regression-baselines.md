@@ -68,19 +68,28 @@ The native bytes (provenance + matched `*.nc` / `*.png`) live in the object stor
 
 ```json
 { "schema": 1,
+  "test_case_version": 1,
   "committed":  { "series.json": "<sha256>", "diagnostic.json": "<sha256>", "output.json": "<sha256>" },
-  "native":  { "<relpath>": { "sha256": "...", "size": ... } },
-  "extraction_inputs": { "files_series_digest": "<sha256>", "input_selectors_digest": "<sha256>" } }
+  "native":  { "<relpath>": { "sha256": "...", "size": ... } } }
 ```
 
+- `test_case_version` is a **monotonic integer** the author/maintainer bumps to declare a new baseline —
+  the deliberate "re-run and re-mint" trigger.
+  Instead of relying on hashes or code, diagnostic developers control when a test case is minted.
+  CI **hard-fails** a PR whose committed bundle changed without a `test_case_version` bump
+  (a forced bump with identical output is harmless — it just re-mints native).
+  Existing test-cases seed at `1`.
 - `committed` binds the committed bundle bytes to the manifest **for integrity only**:
   CI recomputes the committed digests and asserts they equal `manifest.committed`.
   A commit that updates `series.json` but not the manifest (or vice-versa) **fails loudly**.
 - `native` lists the curated native blobs by content digest.
   These digests are **authored only by the `mint` action**: the value is the sha256 of the exact bytes `mint` uploaded to the store.
-- `extraction_inputs` hashes the diagnostic's `files`/`series` patterns and the catalog `input_selectors` —
-  the real extraction inputs the current catalog hash ignores —
-  so a change to extraction behaviour bumps the manifest *at PR time*.
+
+The provenance of *what produced* a baseline (diagnostic version, provider version, datasets, selectors)
+is **not** recomputed here.
+The addition of a manifest file `execution.json` [Climate-REF/rfcs#3](https://github.com/Climate-REF/rfcs/pull/3) could provide this information.
+This manifest file records the run's **identity** (`diagnostic_slug`, `diagnostic_version`, `provider_slug`, `provider_version`, `dataset_hash`, `datasets` by `instance_id`, `selectors`).
+This file should be included in the committed set when implemented.
 
 **Digests do not gate reproducibility.**
 Native bytes are nondeterministic (`.nc`/`.png` embed timestamps, library versions, and provenance, floats jitter across platforms),
@@ -93,7 +102,7 @@ compared by content with tolerance (see Comparison).
 The `native` block **churns on every real mint** (timestamps and maybe SHAs shift),
 so it is not a clean "native meaningfully changed" signal.
 Only the `committed` block is a semantic diff signal
-Remint when the committed bundle changes or a new test-case lands, not on native drift.
+Remint on a `test_case_version` bump (a new baseline, or a new test-case), not on native drift.
 
 Some of the native content may be useful to compare visually for example figures.
 How that is surface is not yet resolved.
@@ -154,7 +163,7 @@ with the CI having write credentials to mint new baselines.
 so anonymous users can fetch the native baseline.
 A dev `run` produces native and a local manifest for previewing the committed-bundle diff
 with the native digests being advisory and never committed.
-A PR commits only the committed bundle + `manifest.{committed,extraction_inputs}` —
+A PR commits only the committed bundle + `manifest.{test_case_version,committed}` —
 the `native` block is authored exclusively by the post-merge `mint` action so native digests exist iff `mint` wrote them.
 
 ## Tiered CI
@@ -165,15 +174,19 @@ Self-hosted runners should never run `execute()` holding write creds on a shared
 Minting stays post-merge behind a manual gate as it requires credentials.
 
 - **PR — any, incl forks — public `ubuntu-latest`, no secrets, no creds.**
-  Routed by changed-files so the check is *honest*:
-  - **New diagnostic / new test-case, or `execute()` changed** -> run `execute()` + `build_execution_result` on the public runner,
+  Routed by the `test_case_version` bump so the check is *honest*:
+  - **`test_case_version` bumped, or a new test-case** -> `pr-test-case-execute`:
+    run `execute()` + `build_execution_result` on the public runner,
     then compare the freshly built committed bundle against what is in git.
-    At this point, any existing native content may be invalidated.
-  - **Extraction changed (`build_execution_result`, `files`/`series`, committed/manifest) and native already exists** ->
-    cheap path: `ref test-cases sync` (read native content) -> `replay` -> compare committed bundle.
-  - A fetch *miss* for an **existing** manifest entry is a **failure, not a skip**
-    (today, missing fixtures silently skip -> false green);
-    a *new* entry has no stored native by definition and takes the execute path instead.
+    A bumped/new version has no stored native by definition, so nothing is fetched —
+    a brand-new test-case validates on its own PR, no follow-up needed.
+  - **No bump, but extraction code changed (`build_execution_result`, `files`/`series`)** -> `pr-test-case-replay`:
+    cheap path — `ref test-cases sync` (read native) -> `replay` against the *existing* baseline -> compare.
+    Catches unintended extraction drift; a real mismatch here means "you changed output but didn't bump the version."
+  - **Coupling gate.** A committed bundle that changed without a `test_case_version` bump is a **hard failure**
+    ("output changed but baseline version not bumped — intended?").
+    A fetch *miss* for an **existing** entry is likewise a failure, not a silent skip.
+    We may need a field on the test-case to continue on failure.
   - **Coverage:** the public runner handles ~90% of test-cases.
     Some heavy ESMValTool ocean diagnostics exceed its compute/memory/disk and will fail there —
     those wait for the future private runner (see below); they are not a silent skip.
@@ -181,7 +194,7 @@ Minting stays post-merge behind a manual gate as it requires credentials.
   A job bound to a GitHub **Environment (`mint`)**:
   the run pauses until a maintainer approves, releasing the write creds only onto **already-merged (trusted) code**.
   On approve: `ref test-cases mint` -> `execute()` + `put` native + author `manifest.native` (bot commit back to `main`).
-  **Mint set** = test-cases whose committed bundle or `extraction_inputs` changed in the merge diff;
+  **Mint set** = test-cases whose `test_case_version` was bumped in the merge diff (plus any brand-new test-case);
   a manual `workflow_dispatch` can target a specific `--provider`/`--diagnostic` for backfills or manual fixes.
 - **Nightly — gated runner.**
   Full sweep to check for any drift.
@@ -212,7 +225,7 @@ sequenceDiagram
     CLI->>CLI: execute() then build_execution_result
     CLI-->>Repo: write committed bundle + local manifest
     Author->>Author: preview committed-bundle diff (small JSON)
-    Author->>Repo: commit committed bundle + manifest.committed/extraction_inputs
+    Author->>Repo: commit committed bundle + manifest.committed + test_case_version
 ```
 
 A local `run` produces native + advisory digests for preview only — the author commits no `native` block.
@@ -229,21 +242,19 @@ sequenceDiagram
     participant Mint as Mint job (gated env, write creds)
     participant Store as NativeStore
 
-    Author->>PR: open PR (diagnostic + committed bundle + manifest.committed/extraction_inputs)
+    Author->>PR: open PR (diagnostic + committed bundle + manifest.committed + test_case_version)
     PR->>CI: trigger checks (routed by changed files)
 
-    alt new diagnostic or execute() changed
+    alt test_case_version bumped, or new test-case
         CI->>CI: run execute() + build_execution_result (no creds)
         CI->>CI: compare freshly built committed bundle (tolerant)
         CI-->>PR: pr-execute check + bundle diff comment
-    else extraction changed, native already exists
+    else no bump, extraction code changed
         CI->>Store: ref test-cases sync (public read)
-        alt native fetch hit
-            CI->>CI: replay then compare committed bundle (tolerant)
-            CI-->>PR: extraction-replay check + bundle diff comment
-        else native missing for an existing entry
-            CI-->>PR: FAIL (no silent skip)
-        end
+        CI->>CI: replay against existing baseline then compare (tolerant)
+        CI-->>PR: extraction-replay check + bundle diff comment
+    else committed bundle changed without a bump
+        CI-->>PR: FAIL (bump test_case_version to re-baseline)
     end
 
     Note over CI: heavy ESMValTool ocean diagnostics may exceed public limits (future private runner)
@@ -265,18 +276,16 @@ How the PR check is chosen from the changed files, and where each path lands:
 
 ```mermaid
 flowchart TD
-    A[PR opened] --> B{What changed?}
+    A[PR opened] --> B{test_case_version bumped?}
 
-    B -->|"new diagnostic or execute() changed"| X["run execute() + build_execution_result on public runner, no creds"]
-    B -->|"extraction only, native exists"| C["sync native (public read)"]
-
-    C --> D{Native fetch hit?}
-    D -->|yes| E["replay then rebuild committed bundle"]
-    D -->|"no (existing entry)"| F["FAIL: no silent skip"]
+    B -->|"yes (or new test-case)"| X["pr-execute: run execute() + build_execution_result, no creds"]
+    B -->|no| V{committed bundle changed?}
+    V -->|yes| F["FAIL: bump test_case_version to re-baseline"]
+    V -->|"no (extraction code changed)"| C["sync native then replay existing baseline"]
 
     X --> G{Diff within tolerance?}
-    E --> G
-    G -->|yes| H["check green (pr-execute / extraction-replay)"]
+    C --> G
+    G -->|yes| H["check green"]
     G -->|no| I["red: bundle diff comment, author fixes"]
     I --> A
     F --> A
@@ -377,6 +386,8 @@ and silent upstream regressions stay invisible until a manual check.
 - Content-addressed artifact stores with a small in-git lock (DVC, Snakemake) — same idea;
   this RFC keeps the client surface to just the REF CLI
   rather than adding a separate toolchain on contributors.
+- **Execution lifecycle ([Climate-REF/rfcs#3](https://github.com/Climate-REF/rfcs/pull/3))** —
+  the `execution.json` self-describing manifest this RFC consumes for baseline provenance information.
 
 # Unresolved questions
 
