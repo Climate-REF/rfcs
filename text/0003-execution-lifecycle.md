@@ -154,6 +154,11 @@ Therefore a manifest with `outcome is None` means *incomplete*:
 either still in flight, or hard-killed (OOM, `SIGKILL`, node loss) before it could write its epitaph.
 This single invariant is what makes crashes diagnosable from disk alone.
 
+The outcome must be written **atomically** (write a temp file, `fsync`, then `rename`),
+so a worker killed mid-write can never leave a half-written outcome that reads as present-but-corrupt.
+A present outcome is therefore always complete, which is what lets a lost (`GONE`) job be trusted
+exactly as much as a cleanly `EXITED` one.
+
 **Drop-dead deadline.**
 Because `deadline` is recorded on disk, an operator — or a reconciling coordinator with a weak transport —
 can flag an overdue execution (`now > deadline` and `outcome is None`) without querying the scheduler.
@@ -242,9 +247,11 @@ for ex in db.in_flight(submitted):                  # successful IS NULL
                 transport.cancel(ex.handle)            # ProcessPool only, other schedulers use native deadlines
             # else: keep waiting
 
-        case Status.EXITED:                          # clean exit - check the outcome from disk
+        case Status.EXITED | Status.GONE as st:      # done - the manifest, not the transport, decides
+            if st is Status.GONE:                    # transport lost the job; the manifest still rules
+                logger.warning(f"{ex} vanished without a clean exit; trusting the on-disk manifest")
             outcome = read_manifest(ex.dir).outcome
-            if outcome is None:                      # exited 0 but wrote no outcome -> incomplete
+            if outcome is None:                      # clean exit w/o epitaph, or hard crash (OOM / SIGKILL)
                 mark_retryable(ex)
             elif outcome.status is SUCCESS:
                 ingest_from_disk(ex.dir)             # CV-validated; same path for every transport
@@ -252,19 +259,14 @@ for ex in db.in_flight(submitted):                  # successful IS NULL
                 mark_failed(ex)                      # diagnostic error, give up
             else:                                    # RECOVERABLE
                 mark_retryable(ex)
-
-        case Status.GONE:                            # no clean exit
-            outcome = read_manifest(ex.dir).outcome  # worker may have logged a recoverable fail first
-            if outcome is None:
-                mark_retryable(ex)                   # hard crash: OOM / SIGKILL / node loss / queue loss
-            else:
-                apply(outcome)                        # manifest wins (e.g. SUCCESS written then node reaped)
 ```
 
-The decisive robustness rule is the last branch:
-if the worker wrote `SUCCESS` and the node then died before the scheduler reaped it,
-the transport reports `GONE` but the manifest reports success — and the manifest wins.
-Transport liveness only adjudicates the *no-manifest-outcome* case.
+`EXITED` and `GONE` therefore take the *same* action — a present manifest outcome is applied either way,
+and an absent one is retryable either way.
+Transport status only separates `RUNNING` from done; the manifest decides the rest.
+`GONE` differs only in that it emits a warning (the transport lost track of the job),
+which matters for the case where the worker wrote `SUCCESS` and the node then died before being reaped:
+the transport reports `GONE`, but the manifest still wins and the result is ingested.
 
 ## Execution states
 
@@ -364,34 +366,34 @@ Each is a launcher plus a status query.
 | `InMemoryTransport`   | `SynchronousExecutor`  | run inline                        | always `EXITED`     | n/a (inline)              |
 | `ProcessPoolTransport`| `LocalExecutor`        | `pool.submit`                     | `future` state      | coordinator (`cancel`)    |
 | `CeleryTransport`     | `CeleryExecutor`       | `app.send_task`                   | `AsyncResult`       | broker (`task_time_limit`)|
-| `HpcTransport`        | `HPCExecutor` (parsl)  | parsl provider submit (Slurm/PBS) | parsl future state  | block walltime + pilot    |
+| `HPCTransport`        | `HPCExecutor` (parsl)  | parsl provider submit (Slurm/PBS) | parsl future state  | block walltime + pilot    |
 
 `ProcessPoolTransport` is the only transport that enforces the deadline coordinator-side
 (via `cancel` -> `future.cancel`), because there is no external scheduler to do it;
 this preserves today's `LocalExecutor` per-task timeout.
 
-`HpcTransport` wraps parsl rather than calling `sbatch` / `qsub` directly.
+`HPCTransport` wraps parsl rather than calling `sbatch` / `qsub` directly.
 parsl requests scheduler *blocks* (pilot jobs) and runs many executions inside each one,
-so the scheduler walltime bounds the allocation, not the individual execution;
+so the scheduler walltime bounds the allocation, not the individual execution (to confirm);
 per-execution `wall_clock` is enforced inside the pilot, as `HPCExecutor.join` does today.
 
-**Celery callback demotes to a latency optimisation.**
+**Celery callback.**
 Today `CeleryExecutor` attaches `link` / `link_error` callbacks (`handle_result` / `handle_failure`)
 that ingest worker-side.
+In production, this requires an additional `orchastrator` worker.
 Under this design the worker writes its bundle and manifest to disk like every other transport,
 and the coordinator (or a resident orchestrator running `drain`) ingests from disk.
-The `link` callback may be kept as an *eager-ingest hook* — "ingest this directory now" rather than at the next
-poll — but it is no longer load-bearing: if the callback is lost, the disk scan recovers the result.
-This dissolves the previous push-vs-pull asymmetry; both modes run the same `ingest_from_disk`.
+The `link` callback may be kept as an *eager-ingest hook* — "ingest this directory now" rather than at the next poll.
+It's no longer load-bearing as if the callback is lost, the disk scan recovers the result.
+This dissolves the previous push-vs-pull asymmetry and both modes run the same `ingest_from_disk`.
 
 ## Migration plan
 
 The cutover replaces the seam the solver calls, so it lands in stages, each independently shippable:
 
-1. **Manifest, additively.** Current executors start writing `execution.json` (both phases).
-   No behaviour change; result directories become self-describing immediately —
-   this alone unlocks regression comparison.
-2. **Seam + local transports.** Introduce `ExecutionLifecycle`, the `Transport` port, `ingest_from_disk`,
+1. **ExecutionManifest, additively.** Current executors start writing `execution.json` (both phases).
+   No behaviour change; result directories become self-describing immediately — this alone unlocks regression comparison.
+2. **New classes + local transports.** Introduce `ExecutionLifecycle`, the `Transport` port, `ingest_from_disk`,
    and `InMemoryTransport` + `ProcessPoolTransport`; route the solver through the lifecycle.
 3. **Celery.** Port to `CeleryTransport`; convert `link`/`link_error` to the optional eager-ingest hook.
 4. **HPC.** Port `HPCExecutor` to `HpcTransport` (Slurm + PBS via parsl).
@@ -457,44 +459,26 @@ crashes remain undiagnosable from durable state.
   reconciles task state from the database — essentially `dispatch` plus `status`-driven `drain`.
 - **Celery.** `task_time_limit` and queue routing; `ResourceHint.queue` maps onto Celery queues and
   `wall_clock` onto `task_time_limit`. Today's `CeleryExecutor` uses neither.
-- **Make / build systems.** A target is rebuilt unless its output exists and is current — the same logic as
-  reading a manifest outcome from disk before deciding to re-run.
+- **Make / build systems.** A target is rebuilt unless its output exists and is current.
+  The same logic as reading a manifest outcome from disk before deciding to re-run.
 
 # Unresolved questions
 
-To resolve through the RFC process:
+Outstanding questions that are not yet resolved:
 
 - The exact `ExecutionManifest` field set and `schema_version` stability guarantees.
 - Whether the Celery eager-ingest hook (`link`) is retained or Celery polls purely via `status`.
-- Where the controlled vocabulary comes from in tests (a permissive fixture vs. the project CV).
-
-To resolve through implementation:
-
 - Exact upsert unique constraints and any Alembic migration
   (`output_fragment`, `provider_version`, and `diagnostic_version` already exist).
-- Mapping parsl future / pilot-block state to `RUNNING | EXITED | GONE`, and enforcing the
-  per-execution deadline inside the pilot.
+- Mapping parsl future state to `RUNNING | EXITED | GONE`,
+  and enforcing the per-execution deadline.
 - The deprecation mechanics for `import_executor_cls` and the executor dotted-path config key.
-
-Out of scope for this RFC (addressed independently later):
-
-- **K8s transport.**
-- **External / "null" execution** — a directory produced entirely outside the REF, then ingested.
-  The format already supports it; the operational contract does not yet.
-- **Cross-deployment portability beyond shared datasets.**
-  Tier 2 (the importing deployment already indexes the same ESGF datasets, resolved by `instance_id`)
-  is enabled by the manifest's `datasets` field.
-  Tier 3 (datasets *not* present locally) needs dataset support for remote / not-yet-local files
-  and is a separate RFC. The manifest carries the cross-link information (`instance_id`) but not the files.
-- **External-execution version policy.** The default is ingest-as-is:
-  a result lands under its declared `diagnostic_version`, surfaces only if it equals the local
-  `promoted_version`, is CV-validated, and is never rejected on version. Hardening is deferred.
-- **Adaptive resource provider and per-execution telemetry columns.**
-- **Making CV validation a hard failure.**
 
 # Future possibilities
 
 - **K8s transport** — a pod per execution with `resources` and an active deadline; `status` from the pod phase.
+  The jobs are long enough running that the start up cost of a container may be negligible.
+  This may even deprecate Celery.
 - **External / null transport** — the lowest-friction modelling-centre adoption path:
   a centre runs the diagnostic in its own pipeline, writes `execution.json` + bundles to the expected layout,
   and `ref ingest <dir>` loads it. The manifest becomes a public, versioned contract.
@@ -503,11 +487,6 @@ Out of scope for this RFC (addressed independently later):
 - **Adaptive `ResourceProvider`** — capture per-execution telemetry (peak RSS, duration) into the manifest
   and the database, then suggest `ResourceHint` memory at, say, p95 × 1.2 over a rolling window.
 - **Cross-restart recovery** — already largely free: because `drain` reconstructs the in-flight set from the
-  database and `status` queries durable scheduler state, a coordinator that was down while a SLURM job finished
-  picks it up on the next `drain`.
-- **Per-provider retry policies** — the single worker-side classifier becomes a per-provider mapping
-  when concrete demand appears.
-
-None of these justify the RFC on their own;
-they show the manifest-plus-liveness seam is shaped for where the project is heading
-without pre-building any of them.
+  database and `status` queries durable scheduler state,
+  a coordinator that was down while a SLURM job finished picks it up on the next `drain`.
+- **Per-provider retry policies** — the single worker-side classifier becomes a per-provider mapping when concrete demand appears.
