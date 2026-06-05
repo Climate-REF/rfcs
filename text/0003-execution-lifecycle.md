@@ -212,33 +212,37 @@ so diagnostics that run for hours without declaring `resources` keep their curre
 
 ## The lifecycle and the drain loop
 
-`ExecutionLifecycle` becomes a deep module that owns submission, the drain loop, retry/dirty, and ingest.
+`ExecutionLifecycle` owns the submission of new executions, the drain loop, retry/dirty, and ingest.
 It is stateless with respect to in-flight work:
 the set of executions to wait on comes from the database (`successful IS NULL`), not from memory.
-This is what makes it re-runnable and crash-safe — `drain` after a restart simply resumes.
+This is what makes it re-runnable and crash-safe. Running `drain` after a restart simply resumes.
 
 ```python
 for group, datasets, definition in planned_executions:
-    execution = Execution(execution_group=group, dataset_hash=datasets.hash,
-                          provider_version=definition.diagnostic.provider.version)
-    lifecycle.submit(execution, definition)   # dispatch(), persist handle; worker writes phase-1 at start
+    execution = Execution(
+        execution_group=group, 
+        dataset_hash=datasets.hash,
+        provider_version=definition.diagnostic.provider.version
+    )
+    # dispatch(), persist handle in db, worker writes phase-1 at start of execution
+    lifecycle.submit(execution, definition)   
 
 lifecycle.drain(timeout=timeout)
 ```
 
-`drain` loops over the in-flight set.
-**The transport decides liveness; the manifest decides outcome;
-a present manifest outcome wins over liveness.**
+`drain` loops over the in-flight executions as queried from the database.
+The transport decides liveness of the exeuction and the manifest determines the outcome.
+If a outcome is present in a manifest, it wins over the liveness check.
 
 ```python
 for ex in db.in_flight(submitted):                  # successful IS NULL
     match transport.status({ex.id: ex.handle})[ex.id]:
         case Status.RUNNING:
-            if now > read_manifest(ex.dir).deadline:   # drop-dead from phase-1 manifest
-                transport.cancel(ex.handle)            # ProcessPool only; schedulers self-kill
+            if now > read_manifest(ex.dir).deadline:   # deadline check
+                transport.cancel(ex.handle)            # ProcessPool only, other schedulers use native deadlines
             # else: keep waiting
 
-        case Status.EXITED:                          # clean exit — ask the disk what it meant
+        case Status.EXITED:                          # clean exit - check the outcome from disk
             outcome = read_manifest(ex.dir).outcome
             if outcome is None:                      # exited 0 but wrote no outcome -> incomplete
                 mark_retryable(ex)
@@ -252,7 +256,7 @@ for ex in db.in_flight(submitted):                  # successful IS NULL
         case Status.GONE:                            # no clean exit
             outcome = read_manifest(ex.dir).outcome  # worker may have logged a recoverable fail first
             if outcome is None:
-                mark_retryable(ex)                   # hard crash: OOM / SIGKILL / node loss
+                mark_retryable(ex)                   # hard crash: OOM / SIGKILL / node loss / queue loss
             else:
                 apply(outcome)                        # manifest wins (e.g. SUCCESS written then node reaped)
 ```
@@ -351,20 +355,25 @@ This is also what enables the existing `reingest` use case to work *without* the
 
 ## Transports
 
-All current executors are replaced, and the two HPC backends are added, as part of this work.
-Each is a launcher plus a status query — typically under a few hundred lines.
+All current executors are replaced, including the parsl-based HPC backend —
+one transport covers both Slurm and PBS, selected by config, as `HPCExecutor` does today.
+Each is a launcher plus a status query.
 
-| Transport             | Replaces / adds        | `dispatch`            | `status` source         | deadline enforced by      |
-|-----------------------|------------------------|-----------------------|-------------------------|---------------------------|
-| `InMemoryTransport`   | `SynchronousExecutor`  | run inline            | always `EXITED`         | n/a (inline)              |
-| `ProcessPoolTransport`| `LocalExecutor`        | `pool.submit`         | `future` state          | coordinator (`cancel`)    |
-| `CeleryTransport`     | `CeleryExecutor`       | `app.send_task`       | `AsyncResult`           | broker (`task_time_limit`)|
-| `SlurmTransport`      | new                    | `sbatch --mem --time` | `sacct` / `squeue`      | scheduler (`--time`)      |
-| `PbsTransport`        | new                    | `qsub -l`             | `qstat`                 | scheduler (walltime)      |
+| Transport             | Replaces               | `dispatch`                        | `status` source     | deadline enforced by      |
+|-----------------------|------------------------|-----------------------------------|---------------------|---------------------------|
+| `InMemoryTransport`   | `SynchronousExecutor`  | run inline                        | always `EXITED`     | n/a (inline)              |
+| `ProcessPoolTransport`| `LocalExecutor`        | `pool.submit`                     | `future` state      | coordinator (`cancel`)    |
+| `CeleryTransport`     | `CeleryExecutor`       | `app.send_task`                   | `AsyncResult`       | broker (`task_time_limit`)|
+| `HpcTransport`        | `HPCExecutor` (parsl)  | parsl provider submit (Slurm/PBS) | parsl future state  | block walltime + pilot    |
 
 `ProcessPoolTransport` is the only transport that enforces the deadline coordinator-side
 (via `cancel` -> `future.cancel`), because there is no external scheduler to do it;
 this preserves today's `LocalExecutor` per-task timeout.
+
+`HpcTransport` wraps parsl rather than calling `sbatch` / `qsub` directly.
+parsl requests scheduler *blocks* (pilot jobs) and runs many executions inside each one,
+so the scheduler walltime bounds the allocation, not the individual execution;
+per-execution `wall_clock` is enforced inside the pilot, as `HPCExecutor.join` does today.
 
 **Celery callback demotes to a latency optimisation.**
 Today `CeleryExecutor` attaches `link` / `link_error` callbacks (`handle_result` / `handle_failure`)
@@ -385,7 +394,7 @@ The cutover replaces the seam the solver calls, so it lands in stages, each inde
 2. **Seam + local transports.** Introduce `ExecutionLifecycle`, the `Transport` port, `ingest_from_disk`,
    and `InMemoryTransport` + `ProcessPoolTransport`; route the solver through the lifecycle.
 3. **Celery.** Port to `CeleryTransport`; convert `link`/`link_error` to the optional eager-ingest hook.
-4. **HPC.** Add `SlurmTransport` and `PbsTransport`.
+4. **HPC.** Port `HPCExecutor` to `HpcTransport` (Slurm + PBS via parsl).
 5. **Cleanup.** Delete the `Executor` protocol and the three old executors once nothing imports them.
 
 `import_executor_cls` (which resolves an executor from a dotted path in `Config`) gains a deprecation cycle:
@@ -463,7 +472,8 @@ To resolve through implementation:
 
 - Exact upsert unique constraints and any Alembic migration
   (`output_fragment`, `provider_version`, and `diagnostic_version` already exist).
-- `sacct` / `squeue` / `qstat` polling cadence and output parsing for the HPC transports.
+- Mapping parsl future / pilot-block state to `RUNNING | EXITED | GONE`, and enforcing the
+  per-execution deadline inside the pilot.
 - The deprecation mechanics for `import_executor_cls` and the executor dotted-path config key.
 
 Out of scope for this RFC (addressed independently later):
