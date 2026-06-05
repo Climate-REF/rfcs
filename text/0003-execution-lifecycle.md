@@ -325,8 +325,11 @@ NON_RETRYABLE = (CondaCommandError,)                                   # -> FAIL
 ```
 
 **Coordinator side — outcome -> decision.**
-The drain loop maps the outcome in the manifest (plus transport liveness) onto `SUCCESS | retry | give up`.
-It never inspects exception types, so it behaves identically for every transport,
+The drain loop maps the manifest outcome onto ingest / retry / give up:
+`SUCCESS` -> ingest, `RECOVERABLE` -> retry, `FAILED` -> give up,
+and a finished execution with no outcome -> retry.
+It never inspects exception types, and it relies on transport liveness only to know the execution has
+finished — not to classify it — so it behaves identically for every transport,
 including remote ones where the exception object never comes back.
 
 The `dirty` flag for an execution group is then updated:
