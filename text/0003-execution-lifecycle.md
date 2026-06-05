@@ -1,16 +1,14 @@
 - Feature Name: `execution_lifecycle`
 - Start Date: 2026-05-12
-- RFC PR: [Climate-REF/rfcs#0003](https://github.com/Climate-REF/rfcs/pull/3)
+- RFC PR: [Climate-REF/rfcs#3](https://github.com/Climate-REF/rfcs/pull/3)
 
 # Summary
-[summary]: #summary
 
 Replace the shallow `Executor` protocol and its three divergent implementations
 (`SynchronousExecutor`, `LocalExecutor`, `CeleryExecutor`)
 with one execution lifecycle built on two ideas.
 
-1. A self-describing, on-disk **execution manifest** (`execution.json`)
-   that records — in CMEC-compatible terms — what an execution *is* and how it *ended*.
+1. A self-describing, on-disk **execution manifest** (`execution.json`) that records what an execution *is* and how it *ended*.
 2. A thin **`Transport`** port that only *launches* work and reports *liveness*
    (`RUNNING | EXITED | GONE`).
 
@@ -24,12 +22,10 @@ makes diagnostic output self-describing so it can be compared across runs and ve
 and reduces every backend to a launcher plus a status query.
 
 # Motivation
-[motivation]: #motivation
 
-The REF needs **one robust way to run diagnostics** that works across a range of deployments —
+The REF needs **one robust way to run diagnostics** that works across a range of deployments -
 a laptop, a Celery cluster, and an HPC batch scheduler at a modelling centre.
-"Robust" has a concrete meaning here:
-an execution survives coordinator and worker crashes cleanly,
+"Robust" has a concrete meaning here: an execution survives coordinator and worker crashes cleanly,
 and an operator can always see *what a run did and why it failed* from durable state, not from a live process.
 
 Today none of that holds, for four reasons.
@@ -44,7 +40,7 @@ A single happy-path run touches eight files in two packages:
   and the `CondaCommandError` branch.
 - `climate_ref_core/diagnostics.py` holds `ExecutionResult.build_from_output_bundle`,
   a static factory that writes three JSON files to disk as a side effect of constructing the result.
-- `climate_ref/executor/result_handling.py` copies scratch→results, ingests inside a nested transaction,
+- `climate_ref/executor/result_handling.py` copies scratch->results, ingests inside a nested transaction,
   and toggles the `dirty` flag in three branches.
 - One of `synchronous.py` / `local.py` / `climate_ref_celery/executor.py`
   re-implements the reattach / commit / mark dance.
@@ -80,17 +76,11 @@ It also blocks any future where a directory is copied between deployments.
 
 ## There is no seam for HPC
 
-Modelling centres run on SLURM and PBS.
+Modelling centres often use SLURM and PBS for task scheduling.
 There is nowhere for a diagnostic to declare it needs 16 GB or 8 hours,
 and nothing a batch adapter could translate into `sbatch --mem --time` or `qsub -l`.
-Each new backend would otherwise re-implement the whole lifecycle inline.
-
-**Primary driver: regression output and crash-robustness.**
-HPC reach and cross-deployment portability are downstream beneficiaries of the same on-disk format,
-not the justification on their own.
 
 # Reference-level explanation
-[reference-level-explanation]: #reference-level-explanation
 
 ## Two verbs: `run` and `ingest`
 
@@ -103,6 +93,9 @@ The lifecycle splits cleanly into two operations that today are tangled together
 Every execution method funnels through the same `ingest`.
 Live completion, re-ingestion after a logic change, and (future) cross-deployment import
 are the *same code path* reading the *same on-disk format*.
+
+The concept of `ingest` isn't new in the REF.
+Datasets are currently ingested to extract information from the dataset and put it in the database.
 
 ## The execution manifest (`execution.json`)
 
@@ -127,7 +120,6 @@ class DatasetRef:
 class Outcome:                   # phase 2 — written when the diagnostic ends
     status: ManifestStatus
     exit_code: int | None
-    started_at: datetime
     finished_at: datetime
     output_bundle: str | None    # output.json     — CMEC output bundle (CMECOutput)
     metric_bundle: str | None    # diagnostic.json  — CMEC diagnostic bundle (CMECMetric)
@@ -138,7 +130,7 @@ class Outcome:                   # phase 2 — written when the diagnostic ends
 @attrs.frozen
 class ExecutionManifest:
     schema_version: int
-    # --- identity: phase 1, written before the diagnostic runs ---
+    # --- identity: phase 1, written when the run starts ---
     diagnostic_slug: str
     diagnostic_version: int
     provider_slug: str
@@ -146,17 +138,27 @@ class ExecutionManifest:
     dataset_hash: str
     datasets: list[DatasetRef]
     selectors: dict[str, str]
+    started_at: datetime             # when the worker began running the diagnostic
+    deadline: datetime               # drop-dead: complete-by = started_at + resources.wall_clock
     # --- outcome: phase 2 ---
     outcome: Outcome | None = None   # None ⇒ incomplete (in-flight, or hard-killed before writing)
 ```
 
 **Two-phase write.**
-The identity half is the *first* file written to the directory, before the diagnostic runs,
-with `outcome = None`.
+The identity half is the *first* file written to the directory, the moment the worker starts —
+before the diagnostic runs, with `outcome = None`.
+It stamps `started_at` and `deadline` (the drop-dead time, `started_at + wall_clock`),
+so the file itself declares when the execution must be complete by.
 The outcome half is the *last* thing the worker writes, **even on a recoverable failure**.
 Therefore a manifest with `outcome is None` means *incomplete*:
 either still in flight, or hard-killed (OOM, `SIGKILL`, node loss) before it could write its epitaph.
 This single invariant is what makes crashes diagnosable from disk alone.
+
+**Drop-dead deadline.**
+Because `deadline` is recorded on disk, an operator — or a reconciling coordinator with a weak transport —
+can flag an overdue execution (`now > deadline` and `outcome is None`) without querying the scheduler.
+It is anchored at `started_at`, never at submit time, so a job that waited hours in a SLURM queue
+is judged from when it actually began.
 
 **CMEC alignment.**
 `provenance` reuses the CMEC `OutputProvenance` shape (`environment`, `modeldata`, `obsdata`, `log`),
@@ -164,10 +166,10 @@ so the manifest captures inputs and environment in standard terms.
 `datasets` references inputs by `instance_id` (the CMEC/ESGF dataset identity),
 which is what makes a directory portable: it names its inputs without carrying them.
 
-## The `Transport` port — liveness, not results
+## The `Transport` port
 
 A transport launches an execution and answers one question: *is it alive?*
-It never carries results.
+It never carries results as that greatly simplifies the required functionality.
 
 ```python
 class Status(enum.Enum):
@@ -185,7 +187,7 @@ class Transport(Protocol):
 
 `dispatch` returns a durable handle (pid, Celery task id, SLURM job id)
 that the lifecycle persists on the `Execution` row in the same commit,
-so a freshly restarted coordinator can still ask about the job.
+so a freshly restarted coordinator can still ask about the job that may be in flight.
 
 ```python
 @attrs.frozen
@@ -200,9 +202,9 @@ class ExecutionEnvelope:
     execution_id: int
     definition: ExecutionDefinition
     resources: ResourceHint
-    # wall_clock travels inside `resources`; the deadline is computed by the transport
-    # (or the scheduler) at job *start*, never at submit time — a queued SLURM/PBS job
-    # may wait hours before it begins.
+    # wall_clock travels inside `resources`; the worker stamps the absolute deadline into the
+    # manifest at job *start* (started_at + wall_clock), never at submit — a queued SLURM/PBS
+    # job may wait hours before it begins.
 ```
 
 The default `wall_clock` is 6 h to match today's `LocalExecutor` budget,
@@ -210,7 +212,7 @@ so diagnostics that run for hours without declaring `resources` keep their curre
 
 ## The lifecycle and the drain loop
 
-`ExecutionLifecycle` is one deep module that owns submission, the drain loop, retry/dirty, and ingest.
+`ExecutionLifecycle` becomes a deep module that owns submission, the drain loop, retry/dirty, and ingest.
 It is stateless with respect to in-flight work:
 the set of executions to wait on comes from the database (`successful IS NULL`), not from memory.
 This is what makes it re-runnable and crash-safe — `drain` after a restart simply resumes.
@@ -219,7 +221,7 @@ This is what makes it re-runnable and crash-safe — `drain` after a restart sim
 for group, datasets, definition in planned_executions:
     execution = Execution(execution_group=group, dataset_hash=datasets.hash,
                           provider_version=definition.diagnostic.provider.version)
-    lifecycle.submit(execution, definition)   # writes phase-1 manifest, dispatch(), persists handle
+    lifecycle.submit(execution, definition)   # dispatch(), persist handle; worker writes phase-1 at start
 
 lifecycle.drain(timeout=timeout)
 ```
@@ -232,13 +234,13 @@ a present manifest outcome wins over liveness.**
 for ex in db.in_flight(submitted):                  # successful IS NULL
     match transport.status({ex.id: ex.handle})[ex.id]:
         case Status.RUNNING:
-            if past_deadline(ex):
-                transport.cancel(ex.handle)         # ProcessPool only; schedulers self-kill
+            if now > read_manifest(ex.dir).deadline:   # drop-dead from phase-1 manifest
+                transport.cancel(ex.handle)            # ProcessPool only; schedulers self-kill
             # else: keep waiting
 
         case Status.EXITED:                          # clean exit — ask the disk what it meant
             outcome = read_manifest(ex.dir).outcome
-            if outcome is None:                      # exited 0 but wrote no outcome → incomplete
+            if outcome is None:                      # exited 0 but wrote no outcome -> incomplete
                 mark_retryable(ex)
             elif outcome.status is SUCCESS:
                 ingest_from_disk(ex.dir)             # CV-validated; same path for every transport
@@ -265,8 +267,8 @@ Transport liveness only adjudicates the *no-manifest-outcome* case.
 ```mermaid
 stateDiagram-v2
     [*] --> Planned: solver creates Execution (successful=NULL)
-    Planned --> Dispatched: transport.dispatch()<br/>phase-1 manifest written
-    Dispatched --> Running: worker starts
+    Planned --> Dispatched: transport.dispatch(), persist handle
+    Dispatched --> Running: worker starts, writes phase-1<br/>(started_at, deadline)
 
     Running --> Running: status=RUNNING, within deadline
     Running --> Gone: status=RUNNING, past deadline<br/>transport.cancel()
@@ -281,12 +283,12 @@ stateDiagram-v2
     poll --> Retryable: manifest.outcome = RECOVERABLE
     poll --> Retryable: manifest.outcome absent<br/>(incomplete / OOM / SIGKILL)
 
-    Ingesting --> Successful: bundles→DB, CV-validated<br/>successful=True, group.dirty=False
+    Ingesting --> Successful: bundles->DB, CV-validated<br/>successful=True, group.dirty=False
     Ingesting --> Retryable: ingest error
 
     Successful --> [*]
     Failed --> [*]: successful=False, group.dirty=False
-    Retryable --> [*]: successful=False, group.dirty=True<br/>→ new Execution next solve
+    Retryable --> [*]: successful=False, group.dirty=True<br/>-> new Execution next solve
 
     note right of Dispatched
         External/Null transport (future):
@@ -302,27 +304,30 @@ A row has three terminal outcomes:
 `Execution`).
 A retry never re-runs the same row.
 
-## Retry and dirty: two clearly separated decisions
+## Execution Status
 
-Classification happens in two places, and only two.
+Classification of the status of an execution happens in two places.
 
-**Worker side — exception → outcome.**
+**Worker side — exception -> outcome.**
 The worker maps the raised exception (or a clean return) onto `ManifestStatus` and writes it to the manifest.
 This is the one place that knows exception *types*, because the exception is only ever raised on the worker.
 It consolidates the logic spread today across `_is_system_error` and the `CondaCommandError` branch:
 
 ```python
-SYSTEM_ERRORS = (OSError, MemoryError, SystemExit, KeyboardInterrupt)  # → RECOVERABLE
-NON_RETRYABLE = (CondaCommandError,)                                   # → FAILED
+SYSTEM_ERRORS = (OSError, MemoryError, SystemExit, KeyboardInterrupt)  # -> RECOVERABLE
+NON_RETRYABLE = (CondaCommandError,)                                   # -> FAILED
 ```
 
-**Coordinator side — outcome → decision.**
-The drain loop maps the already-classified outcome (plus transport liveness) onto `SUCCESS | retry | give up`.
+**Coordinator side — outcome -> decision.**
+The drain loop maps the outcome in the manifest (plus transport liveness) onto `SUCCESS | retry | give up`.
 It never inspects exception types, so it behaves identically for every transport,
 including remote ones where the exception object never comes back.
 
-The `dirty` flag follows directly:
-`SUCCESS` and `FAILED` clear it; `RECOVERABLE` and incomplete leave it set so the next solve retries.
+The `dirty` flag for an execution group is then updated:
+
+- `SUCCESS` and `FAILED` clear the dirty state.
+- `RECOVERABLE` and incomplete leave it set so the next solve retries the execution.
+
 User-initiated `dirty = True` resets in `cli/executions.py` (rerun / reset) stay separate by design.
 
 ## Ingest from disk
@@ -336,8 +341,7 @@ It is the only path that mutates result tables, and it is:
   Each solve mints a new `execution_id` per attempt, so retries never collide;
   the conflict clause only guards re-ingestion of the *same* execution during a replay or eager/poll race.
 - **CV-validated.** The CMEC diagnostic and series bundles are validated against the controlled vocabulary
-  at ingest, exactly as today. (This RFC keeps the current `logger.warning` behaviour;
-  making CV a hard failure is explicitly out of scope — see below.)
+  at ingest, exactly as today. Validations errors result in warnings rather than hard failures for now.
 - **Portable.** Result directories hold results only, with relative internal paths.
   Inputs are referenced by `instance_id` and resolved against the importing deployment's dataset index;
   a directory never carries or hardcodes input data.
@@ -359,7 +363,7 @@ Each is a launcher plus a status query — typically under a few hundred lines.
 | `PbsTransport`        | new                    | `qsub -l`             | `qstat`                 | scheduler (walltime)      |
 
 `ProcessPoolTransport` is the only transport that enforces the deadline coordinator-side
-(via `cancel` → `future.cancel`), because there is no external scheduler to do it;
+(via `cancel` -> `future.cancel`), because there is no external scheduler to do it;
 this preserves today's `LocalExecutor` per-task timeout.
 
 **Celery callback demotes to a latency optimisation.**
@@ -388,7 +392,6 @@ The cutover replaces the seam the solver calls, so it lands in stages, each inde
 known names map to the new transports, custom dotted paths warn, and a config-migration note ships with step 5.
 
 # Drawbacks
-[drawbacks]: #drawbacks
 
 - **The migration is wide.** The seam the solver calls is replaced, touching `climate-ref-core`,
   `climate-ref`, and `climate-ref-celery`. The staging above bounds the risk but does not remove it.
@@ -406,7 +409,6 @@ known names map to the new transports, custom dotted paths warn, and a config-mi
   and by the manifest making the first failed run diagnosable.
 
 # Rationale and alternatives
-[rationale-and-alternatives]: #rationale-and-alternatives
 
 The central choice is **where the source of truth lives**.
 This design puts it on disk (the manifest), with the transport reduced to a liveness oracle.
@@ -435,7 +437,6 @@ results stay anonymous on disk, so regression comparison and replay stay impossi
 crashes remain undiagnosable from durable state.
 
 # Prior art
-[prior-art]: #prior-art
 
 - **CMEC / EMDS.** The output and diagnostic bundles, provenance, and dimensions are CMEC concepts;
   the manifest extends CMEC provenance rather than inventing a parallel vocabulary.
@@ -451,7 +452,6 @@ crashes remain undiagnosable from durable state.
   reading a manifest outcome from disk before deciding to re-run.
 
 # Unresolved questions
-[unresolved-questions]: #unresolved-questions
 
 To resolve through the RFC process:
 
@@ -483,7 +483,6 @@ Out of scope for this RFC (addressed independently later):
 - **Making CV validation a hard failure.**
 
 # Future possibilities
-[future-possibilities]: #future-possibilities
 
 - **K8s transport** — a pod per execution with `resources` and an active deadline; `status` from the pod phase.
 - **External / null transport** — the lowest-friction modelling-centre adoption path:
